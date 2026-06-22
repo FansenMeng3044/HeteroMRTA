@@ -151,7 +151,8 @@ def main():
         temperature=DeepSeekBiasParams.DEEPSEEK_TEMPERATURE,
         max_tokens=DeepSeekBiasParams.DEEPSEEK_MAX_TOKENS,
         timeout=DeepSeekBiasParams.DEEPSEEK_TIMEOUT,
-        use_json_response=DeepSeekBiasParams.DEEPSEEK_USE_JSON_RESPONSE)
+        use_json_response=DeepSeekBiasParams.DEEPSEEK_USE_JSON_RESPONSE,
+        thinking_type=DeepSeekBiasParams.DEEPSEEK_THINKING_TYPE)
     bias_controller = DeepSeekBiasController(
         enabled=DeepSeekBiasParams.ENABLE_DEEPSEEK_BIAS,
         client=deepseek_client,

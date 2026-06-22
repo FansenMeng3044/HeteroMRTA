@@ -16,7 +16,7 @@ from utils.bias_manager import (
     normalize_bias_snapshot,
 )
 from utils.deepseek_bias_controller import DeepSeekBiasController
-from utils.deepseek_client import DeepSeekClient
+from utils.deepseek_client import DeepSeekClient, DeepSeekResponseTruncated
 
 
 VALID_RAW_CONFIG = {
@@ -97,9 +97,11 @@ class BiasManagerTest(unittest.TestCase):
         self.assertEqual(
             'deepseek-v4-flash', DeepSeekBiasParams.DEEPSEEK_MODEL)
         self.assertEqual(0.0, DeepSeekBiasParams.DEEPSEEK_TEMPERATURE)
-        self.assertEqual(1024, DeepSeekBiasParams.DEEPSEEK_MAX_TOKENS)
-        self.assertEqual(60, DeepSeekBiasParams.DEEPSEEK_TIMEOUT)
+        self.assertEqual(4096, DeepSeekBiasParams.DEEPSEEK_MAX_TOKENS)
+        self.assertEqual(120, DeepSeekBiasParams.DEEPSEEK_TIMEOUT)
         self.assertTrue(DeepSeekBiasParams.DEEPSEEK_USE_JSON_RESPONSE)
+        self.assertEqual(
+            'disabled', DeepSeekBiasParams.DEEPSEEK_THINKING_TYPE)
         self.assertEqual(0.3, DeepSeekBiasParams.LLM_BIAS_EMA_ALPHA)
 
     def test_initial_off_ema_active_file_and_restore(self):
@@ -210,6 +212,7 @@ class DeepSeekClientTest(unittest.TestCase):
         client = DeepSeekClient(
             'https://api.deepseek.com',
             'deepseek-v4-flash',
+            thinking_type='disabled',
             transport=transport)
         with tempfile.TemporaryDirectory() as temp_dir:
             report = Path(temp_dir) / 'report.md'
@@ -221,6 +224,9 @@ class DeepSeekClientTest(unittest.TestCase):
         self.assertEqual(
             {'type': 'json_object'},
             captured['payload']['response_format'])
+        self.assertEqual(
+            {'type': 'disabled'},
+            captured['payload']['thinking'])
         self.assertNotIn('secret-value', prompt)
         self.assertNotIn('secret-value', json.dumps(raw))
         self.assertEqual(
@@ -236,6 +242,27 @@ class DeepSeekClientTest(unittest.TestCase):
             report.write_text('evidence', encoding='utf-8')
             with mock.patch.dict(os.environ, {}, clear=True):
                 with self.assertRaises(RuntimeError):
+                    client.request_bias_config(report)
+
+    def test_length_finish_reason_is_rejected(self):
+        def transport(url, headers, payload, timeout):
+            return {
+                'choices': [{
+                    'finish_reason': 'length',
+                    'message': {'content': json.dumps(VALID_RAW_CONFIG)},
+                }]
+            }
+
+        client = DeepSeekClient(
+            'https://api.deepseek.com',
+            'deepseek-v4-flash',
+            transport=transport)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = Path(temp_dir) / 'report.md'
+            report.write_text('evidence', encoding='utf-8')
+            with mock.patch.dict(
+                    os.environ, {'DEEPSEEK_API_KEY': 'secret'}):
+                with self.assertRaises(DeepSeekResponseTruncated):
                     client.request_bias_config(report)
 
 
@@ -361,6 +388,52 @@ class DeepSeekBiasControllerTest(unittest.TestCase):
             self.assertFalse(snapshot['apply_bias'])
             self.assertEqual(0.0, snapshot['used_weight'])
             self.assertEqual(1, len(calls))
+
+    def test_truncated_response_writes_visible_warning_and_fallback(self):
+        def transport(*args):
+            return {
+                'choices': [{
+                    'finish_reason': 'length',
+                    'message': {'content': '{"weights":'},
+                }]
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            responses = root / 'responses'
+            manager = BiasManager(
+                output_dir=root / 'bias',
+                response_output_dir=responses)
+            client = DeepSeekClient(
+                'https://api.deepseek.com',
+                'deepseek-v4-flash',
+                transport=transport)
+            controller = DeepSeekBiasController(
+                True, client, manager, responses, 3000)
+            report = self._report(root)
+            with mock.patch.dict(
+                    os.environ, {'DEEPSEEK_API_KEY': 'secret'}):
+                snapshot, updated = controller.process_report(report)
+
+            self.assertFalse(updated)
+            self.assertFalse(snapshot['apply_bias'])
+            raw = json.loads((
+                responses / 'deepseek_raw_00000000_00003000.json'
+            ).read_text(encoding='utf-8'))
+            sanitized = json.loads((
+                responses / 'deepseek_sanitized_00000000_00003000.json'
+            ).read_text(encoding='utf-8'))
+            attempt = json.loads((
+                responses / 'deepseek_attempt_00000000_00003000.json'
+            ).read_text(encoding='utf-8'))
+            warning = (
+                responses / 'deepseek_warning_00000000_00003000.txt')
+            self.assertTrue(raw['truncated'])
+            self.assertTrue(sanitized['truncated'])
+            self.assertTrue(attempt['truncated'])
+            self.assertEqual('length', raw['finish_reason'])
+            self.assertTrue(warning.exists())
+            self.assertIn('truncated', warning.read_text(encoding='utf-8'))
 
     def test_missing_report_is_a_safe_claimed_failure(self):
         calls = []

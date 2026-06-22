@@ -41,9 +41,10 @@ deepseek_bias_update_interval_steps: 3000
 deepseek_base_url: "https://api.deepseek.com"
 deepseek_model: "deepseek-v4-flash"
 deepseek_temperature: 0.0
-deepseek_max_tokens: 1024
-deepseek_timeout: 60
+deepseek_max_tokens: 4096
+deepseek_timeout: 120
 deepseek_use_json_response: true
+deepseek_thinking_type: "disabled"
 deepseek_response_output_dir: "./evidence_logs/deepseek_responses"
 
 llm_bias_ema_alpha: 0.3
@@ -65,6 +66,14 @@ configuration, prompts, responses, logs, exceptions, or checkpoints.
 - After a successful response, later failures retain the previous safe
   snapshot.
 - Existing attempt and active-bias files are restored on restart.
+- DeepSeek V4 thinking mode is disabled for this narrow structured-JSON call,
+  so the output budget is reserved for the sanitized config instead of hidden
+  reasoning. A `finish_reason` of `length`, `content_filter`, or
+  `insufficient_system_resource` is treated as a failed window update.
+- If `finish_reason` is `length`, the response is marked as truncated in the
+  raw, sanitized, and attempt JSON files. A human-readable
+  `deepseek_warning_<window>.txt` file is also written and the main process
+  prints a warning.
 
 ## Sanitized Bias
 
@@ -138,6 +147,7 @@ evidence_logs/
     deepseek_prompt_00000000_00003000.txt
     deepseek_raw_00000000_00003000.json
     deepseek_sanitized_00000000_00003000.json
+    deepseek_warning_00000000_00003000.txt
     deepseek_attempt_00000000_00003000.json
   bias_configs/
     active_bias_config_00003000.json

@@ -6,6 +6,13 @@ import urllib.request
 from pathlib import Path
 
 
+class DeepSeekResponseTruncated(RuntimeError):
+    """Raised when DeepSeek reports finish_reason=length."""
+
+    truncated = True
+    finish_reason = 'length'
+
+
 def _default_transport(url, headers, payload, timeout):
     request = urllib.request.Request(
         url,
@@ -20,13 +27,15 @@ class DeepSeekClient:
     """Main-process-only DeepSeek client with injectable network transport."""
 
     def __init__(self, base_url, model, temperature=0.0, max_tokens=1024,
-                 timeout=60, use_json_response=True, transport=None):
+                 timeout=60, use_json_response=True, thinking_type=None,
+                 transport=None):
         self.base_url = base_url.rstrip('/')
         self.model = model
         self.temperature = float(temperature)
         self.max_tokens = int(max_tokens)
         self.timeout = int(timeout)
         self.use_json_response = bool(use_json_response)
+        self.thinking_type = thinking_type
         self.transport = transport or _default_transport
 
     @staticmethod
@@ -55,6 +64,8 @@ class DeepSeekClient:
             'temperature': self.temperature,
             'max_tokens': self.max_tokens,
         }
+        if self.thinking_type:
+            payload['thinking'] = {'type': self.thinking_type}
         if self.use_json_response:
             payload['response_format'] = {'type': 'json_object'}
         response = self.transport(
@@ -65,7 +76,14 @@ class DeepSeekClient:
             },
             payload,
             self.timeout)
-        content = response['choices'][0]['message']['content']
+        choice = response['choices'][0]
+        finish_reason = choice.get('finish_reason')
+        if finish_reason == 'length':
+            raise DeepSeekResponseTruncated(
+                'DeepSeek response exceeded max_tokens')
+        if finish_reason in ('content_filter', 'insufficient_system_resource'):
+            raise RuntimeError('DeepSeek finish_reason={}'.format(finish_reason))
+        content = choice['message']['content']
         return prompt, response, self._parse_json_content(content)
 
     @staticmethod

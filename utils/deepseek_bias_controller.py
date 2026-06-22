@@ -2,6 +2,8 @@ import json
 import re
 from pathlib import Path
 
+from utils.deepseek_client import DeepSeekResponseTruncated
+
 
 class DeepSeekBiasController:
     """Claim report windows once and update the main-process BiasManager."""
@@ -41,6 +43,8 @@ class DeepSeekBiasController:
             'deepseek_raw_{}.json'.format(stem))
         sanitized_path = self.response_output_dir / (
             'deepseek_sanitized_{}.json'.format(stem))
+        warning_path = self.response_output_dir / (
+            'deepseek_warning_{}.txt'.format(stem))
 
         if attempt_path.exists():
             self.last_attempt_end_step = max(
@@ -84,9 +88,21 @@ class DeepSeekBiasController:
             return snapshot, True
         except Exception as error:
             # Persist only the exception type to avoid leaking request headers.
+            truncated = isinstance(error, DeepSeekResponseTruncated)
+            warning = None
+            if truncated:
+                warning = (
+                    'DeepSeek response was truncated at window '
+                    '{}-{}. Bias update was skipped and the previous safe '
+                    'config remains active. Increase DEEPSEEK_MAX_TOKENS, '
+                    'reduce report size, or keep thinking disabled.'
+                ).format(start_step, end_step)
             failure = {
                 'status': 'failed',
                 'error_type': type(error).__name__,
+                'finish_reason': getattr(error, 'finish_reason', None),
+                'truncated': truncated,
+                'warning': warning,
                 'source_report': report_path.name,
                 'window_start': start_step,
                 'window_end': end_step,
@@ -94,9 +110,14 @@ class DeepSeekBiasController:
             self._safe_write_json(raw_path, failure)
             self._safe_write_json(sanitized_path, {
                 'status': 'fallback',
+                'truncated': truncated,
+                'warning': warning,
                 'active_bias': self.bias_manager.get_snapshot(),
             })
             self._safe_write_json(attempt_path, failure)
+            if warning:
+                self._safe_write_text(warning_path, warning + '\n')
+                print('DeepSeek warning:', warning)
             return self.bias_manager.get_snapshot(), False
 
     def _restore_last_attempt_end(self):
@@ -138,5 +159,12 @@ class DeepSeekBiasController:
     def _safe_write_json(cls, path, value):
         try:
             cls._write_json(path, value)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _safe_write_text(path, value):
+        try:
+            path.write_text(value, encoding='utf-8')
         except Exception:
             pass

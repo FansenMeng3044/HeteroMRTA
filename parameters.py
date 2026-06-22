@@ -67,9 +67,10 @@ class DeepSeekBiasParams:
     DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
     DEEPSEEK_MODEL = 'deepseek-v4-flash'
     DEEPSEEK_TEMPERATURE = 0.0
-    DEEPSEEK_MAX_TOKENS = 1024
-    DEEPSEEK_TIMEOUT = 60
+    DEEPSEEK_MAX_TOKENS = 4096
+    DEEPSEEK_TIMEOUT = 120
     DEEPSEEK_USE_JSON_RESPONSE = True
+    DEEPSEEK_THINKING_TYPE = 'disabled'
     DEEPSEEK_RESPONSE_OUTPUT_DIR = './evidence_logs/deepseek_responses'
     BIAS_CONFIG_OUTPUT_DIR = './evidence_logs/bias_configs'
     LLM_BIAS_EMA_ALPHA = 0.3
