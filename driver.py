@@ -14,6 +14,15 @@ from parameters import *
 from env.task_env import TaskEnv
 from scipy.stats import ttest_rel
 from torch.distributions import Categorical
+from utils.evidence_recorder import EvidenceRecorder
+from utils.bias_manager import BiasManager
+from utils.deepseek_client import DeepSeekClient
+from utils.deepseek_bias_controller import DeepSeekBiasController
+from utils.rollout_bias_sync import (
+    complete_evidence_payloads,
+    rollout_uses_active_snapshot,
+    slice_transition_buffer,
+)
 
 
 class Logger(object):
@@ -117,6 +126,41 @@ def fuse_two_dicts(ini_dictionary1, ini_dictionary2):
 
 def main():
     logger = Logger()
+    evidence_recorder = EvidenceRecorder(
+        enabled=EvidenceParams.ENABLE_EVIDENCE_LOGGING,
+        interval_steps=EvidenceParams.EVIDENCE_LOG_INTERVAL_STEPS,
+        output_dir=EvidenceParams.EVIDENCE_OUTPUT_DIR,
+        max_cases_per_report=EvidenceParams.MAX_CASES_PER_REPORT,
+        low_threshold=EvidenceParams.LOW_CAPABILITY_THRESHOLD,
+        better_alternative_gap=EvidenceParams.BETTER_ALTERNATIVE_GAP,
+        deadlock_lookback=EvidenceParams.DEADLOCK_LOOKBACK_DECISIONS)
+    bias_manager = BiasManager(
+        enabled=DeepSeekBiasParams.ENABLE_DEEPSEEK_BIAS,
+        output_dir=DeepSeekBiasParams.BIAS_CONFIG_OUTPUT_DIR,
+        response_output_dir=(
+            DeepSeekBiasParams.DEEPSEEK_RESPONSE_OUTPUT_DIR),
+        ema_alpha=DeepSeekBiasParams.LLM_BIAS_EMA_ALPHA,
+        update_interval_steps=(
+            DeepSeekBiasParams.DEEPSEEK_BIAS_UPDATE_INTERVAL_STEPS),
+        weight_range=DeepSeekBiasParams.WEIGHT_RANGE,
+        lambda_range=DeepSeekBiasParams.LAMBDA_RANGE,
+        clip_bound_range=DeepSeekBiasParams.CLIP_BOUND_RANGE)
+    deepseek_client = DeepSeekClient(
+        base_url=DeepSeekBiasParams.DEEPSEEK_BASE_URL,
+        model=DeepSeekBiasParams.DEEPSEEK_MODEL,
+        temperature=DeepSeekBiasParams.DEEPSEEK_TEMPERATURE,
+        max_tokens=DeepSeekBiasParams.DEEPSEEK_MAX_TOKENS,
+        timeout=DeepSeekBiasParams.DEEPSEEK_TIMEOUT,
+        use_json_response=DeepSeekBiasParams.DEEPSEEK_USE_JSON_RESPONSE)
+    bias_controller = DeepSeekBiasController(
+        enabled=DeepSeekBiasParams.ENABLE_DEEPSEEK_BIAS,
+        client=deepseek_client,
+        bias_manager=bias_manager,
+        response_output_dir=(
+            DeepSeekBiasParams.DEEPSEEK_RESPONSE_OUTPUT_DIR),
+        update_interval_steps=(
+            DeepSeekBiasParams.DEEPSEEK_BIAS_UPDATE_INTERVAL_STEPS))
+    active_bias_config = bias_manager.get_snapshot()
     ray.init()
     device = torch.device('cuda') if TrainParams.USE_GPU_GLOBAL else torch.device('cpu')
     local_device = torch.device('cuda') if TrainParams.USE_GPU else torch.device('cpu')
@@ -154,11 +198,16 @@ def main():
 
     env_params = logger.generate_env_params(curr_level)
     for i, meta_agent in enumerate(meta_agents):
-        jobs.append(meta_agent.training.remote(weights_memory, baseline_weights_memory, curr_episode, env_params))
+        jobs.append(meta_agent.training.remote(
+            weights_memory,
+            baseline_weights_memory,
+            curr_episode,
+            env_params,
+            active_bias_config))
         curr_episode += 1
     test_set = logger.generate_test_set_seed()
     baseline_value = None
-    experience_buffer = {idx:[] for idx in range(7)}
+    experience_buffer = {idx:[] for idx in range(9)}
     perf_metrics = {'success_rate': [], 'makespan': [], 'time_cost': [], 'waiting_time': [], 'travel_dist': [], 'efficiency': []}
     training_data = []
 
@@ -167,9 +216,56 @@ def main():
             # wait for any job to be completed
             done_id, jobs = ray.wait(jobs)
             done_job = ray.get(done_id)[0]
-            buffer, metrics, info = done_job
-            experience_buffer = fuse_two_dicts(experience_buffer, buffer)
-            perf_metrics = fuse_two_dicts(perf_metrics, metrics)
+            buffer, metrics, info, evidence_payload = done_job
+            generated_reports = []
+            stale_rollout = not rollout_uses_active_snapshot(
+                info, active_bias_config)
+            if stale_rollout:
+                print(
+                    'Discarded stale rollout bias version',
+                    info.get('bias_global_step'),
+                    'while active version is',
+                    active_bias_config['global_step'])
+            else:
+                transition_count = len(buffer[0])
+                accepted_count = transition_count
+                accepted_payload = evidence_payload
+                if evidence_recorder.enabled and transition_count:
+                    steps_to_boundary = (
+                        evidence_recorder.window_start
+                        + evidence_recorder.interval_steps
+                        - evidence_recorder.global_step)
+                    accepted_count = min(
+                        transition_count, max(0, steps_to_boundary))
+                    accepted_payload = complete_evidence_payloads(
+                        evidence_payload,
+                        accepted_count,
+                        info.get('episode_number', 0))
+                accepted_buffer = slice_transition_buffer(
+                    buffer, accepted_count)
+                experience_buffer = fuse_two_dicts(
+                    experience_buffer, accepted_buffer)
+                if accepted_count == transition_count:
+                    perf_metrics = fuse_two_dicts(perf_metrics, metrics)
+
+                for episode_payload in accepted_payload:
+                    try:
+                        written_paths = (
+                            evidence_recorder.record_episode_payload(
+                                episode_payload))
+                        generated_reports.extend(
+                            path for path in written_paths
+                            if str(path).lower().endswith('.md'))
+                    except Exception as error:
+                        # Logging failures must not terminate training.
+                        print('Evidence logging warning:', error)
+                for report_path in generated_reports:
+                    active_bias_config, updated = (
+                        bias_controller.process_report(report_path))
+                    if updated:
+                        print(
+                            'Updated cached capability_match bias at step',
+                            active_bias_config['global_step'])
 
             update_done = False
             if len(experience_buffer[0]) >= TrainParams.BATCH_SIZE:
@@ -194,9 +290,19 @@ def main():
                     reward_batch = torch.stack(rollouts[4], dim=0).unsqueeze(1).to(device)  # (batch,1,1)
                     index = torch.stack(rollouts[5]).to(device)
                     advantage_batch = torch.stack(rollouts[6], dim=0).to(device)  # (batch,1,1)
+                    capability_match_batch = torch.stack(
+                        rollouts[7], dim=0).to(device)
+                    bias_params_batch = torch.stack(
+                        rollouts[8], dim=0).to(device)
 
                     # REINFORCE
-                    probs, _ = global_network(task_inputs, agent_inputs, global_mask_batch, index)
+                    probs, _ = global_network(
+                        task_inputs,
+                        agent_inputs,
+                        global_mask_batch,
+                        index,
+                        capability_match=capability_match_batch,
+                        bias_params=bias_params_batch)
                     dist = Categorical(probs)
                     logp = dist.log_prob(action_batch.flatten())
                     entropy = dist.entropy().mean()
@@ -241,7 +347,12 @@ def main():
                 baseline_weights_memory = ray.put(baseline_weights)
 
             env_params = logger.generate_env_params(curr_level)
-            jobs.append(meta_agents[info['id']].training.remote(weights_memory, baseline_weights_memory, curr_episode, env_params))
+            jobs.append(meta_agents[info['id']].training.remote(
+                weights_memory,
+                baseline_weights_memory,
+                curr_episode,
+                env_params,
+                active_bias_config))
             curr_episode += 1
 
             if curr_episode // (TrainParams.INCREASE_DIFFICULTY * (curr_level + 1)) == 1 and curr_level < 10:
@@ -266,14 +377,21 @@ def main():
                             ray.get(test_agent.set_baseline_weights.remote(baseline_weights_memory))
                         rewards = dict()
                         seed_list = copy.deepcopy(test_set)
-                        evaluate_jobs = [test_agent_list[i].testing.remote(seed=seed_list.pop()) for i in range(TrainParams.NUM_META_AGENT)]
+                        evaluate_jobs = [
+                            test_agent_list[i].testing.remote(
+                                seed=seed_list.pop(),
+                                bias_config=active_bias_config)
+                            for i in range(TrainParams.NUM_META_AGENT)]
                         while True:
                             test_done_id, evaluate_jobs = ray.wait(evaluate_jobs)
                             test_result = ray.get(test_done_id)[0]
                             reward, seed, meta_id = test_result
                             rewards[seed] = reward
                             if seed_list:
-                                evaluate_jobs.append(test_agent_list[meta_id].testing.remote(seed=seed_list.pop()))
+                                evaluate_jobs.append(
+                                    test_agent_list[meta_id].testing.remote(
+                                        seed=seed_list.pop(),
+                                        bias_config=active_bias_config))
                             if len(rewards) == TrainParams.EVALUATION_SAMPLES:
                                 break
                         rewards = dict(sorted(rewards.items()))
@@ -287,14 +405,21 @@ def main():
                         ray.get(test_agent.set_baseline_weights.remote(weights_memory))
                     rewards = dict()
                     seed_list = copy.deepcopy(test_set)
-                    evaluate_jobs = [test_agent_list[i].testing.remote(seed=seed_list.pop()) for i in range(TrainParams.NUM_META_AGENT)]
+                    evaluate_jobs = [
+                        test_agent_list[i].testing.remote(
+                            seed=seed_list.pop(),
+                            bias_config=active_bias_config)
+                        for i in range(TrainParams.NUM_META_AGENT)]
                     while True:
                         test_done_id, evaluate_jobs = ray.wait(evaluate_jobs)
                         test_result = ray.get(test_done_id)[0]
                         reward, seed, meta_id = test_result
                         rewards[seed] = reward
                         if seed_list:
-                            evaluate_jobs.append(test_agent_list[meta_id].testing.remote(seed=seed_list.pop()))
+                            evaluate_jobs.append(
+                                test_agent_list[meta_id].testing.remote(
+                                    seed=seed_list.pop(),
+                                    bias_config=active_bias_config))
                         if len(rewards) == TrainParams.EVALUATION_SAMPLES:
                             break
                     rewards = dict(sorted(rewards.items()))
@@ -328,13 +453,31 @@ def main():
                             logger.save_model(curr_episode, None, best_perf)
                     jobs = []
                     for i, meta_agent in enumerate(meta_agents):
-                        jobs.append(meta_agent.training.remote(weights_memory, baseline_weights_memory, curr_episode, env_params))
+                        jobs.append(meta_agent.training.remote(
+                            weights_memory,
+                            baseline_weights_memory,
+                            curr_episode,
+                            env_params,
+                            active_bias_config))
                         curr_episode += 1
 
     except KeyboardInterrupt:
         print("CTRL_C pressed. Killing remote workers")
         for a in meta_agents:
             ray.kill(a)
+    finally:
+        try:
+            written_paths = evidence_recorder.flush_window_if_needed(force=True)
+            for report_path in written_paths:
+                if str(report_path).lower().endswith('.md'):
+                    active_bias_config, _ = bias_controller.process_report(
+                        report_path)
+            if written_paths:
+                print('Flushed evidence report files:')
+                for path in written_paths:
+                    print(path)
+        except Exception as error:
+            print('Evidence flush warning:', error)
 
 
 if __name__ == "__main__":

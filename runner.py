@@ -6,6 +6,7 @@ from attention import AttentionNet
 from worker import Worker
 from parameters import *
 from env.task_env import TaskEnv
+from utils.bias_manager import normalize_bias_snapshot
 
 
 class Runner(object):
@@ -19,6 +20,7 @@ class Runner(object):
         self.localNetwork.to(self.device)
         self.localBaseline = AttentionNet(TrainParams.AGENT_INPUT_DIM, TrainParams.TASK_INPUT_DIM, TrainParams.EMBEDDING_DIM)
         self.localBaseline.to(self.device)
+        self.bias_config = None
 
     def get_weights(self):
         return self.localNetwork.state_dict()
@@ -29,32 +31,39 @@ class Runner(object):
     def set_baseline_weights(self, weights):
         self.localBaseline.load_state_dict(weights)
 
-    def training(self, global_weights, baseline_weights, curr_episode, env_params):
+    def training(self, global_weights, baseline_weights, curr_episode, env_params,
+                 bias_config=None):
         print("starting episode {} on metaAgent {}".format(curr_episode, self.metaAgentID))
         # set the local weights to the global weight values from the master network
         self.set_weights(global_weights)
         self.set_baseline_weights(baseline_weights)
+        self.bias_config = bias_config
         save_img = False
         if SaverParams.SAVE_IMG:
             if curr_episode % SaverParams.SAVE_IMG_GAP == 0:
                 save_img = True
         worker = Worker(self.metaAgentID, self.localNetwork, self.localBaseline,
-                        curr_episode, self.device, save_img, None, env_params)
+                        curr_episode, self.device, save_img, None, env_params,
+                        bias_config=bias_config)
         worker.work(curr_episode)
 
         buffer = worker.experience
         perf_metrics = worker.perf_metrics
+        evidence_payload = worker.evidence_payload
 
         info = {
             "id": self.metaAgentID,
             "episode_number": curr_episode,
+            "bias_global_step": normalize_bias_snapshot(
+                bias_config)['global_step'],
         }
 
-        return buffer, perf_metrics, info
+        return buffer, perf_metrics, info, evidence_payload
 
-    def testing(self, seed=None):
+    def testing(self, seed=None, bias_config=None):
         worker = Worker(self.metaAgentID, self.localNetwork, self.localBaseline,
-                        0, self.device, False, seed)
+                        0, self.device, False, seed,
+                        bias_config=bias_config)
         reward = worker.baseline_test()
         return reward, seed, self.metaAgentID
 

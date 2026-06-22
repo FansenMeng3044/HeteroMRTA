@@ -44,3 +44,36 @@ class SaverParams:
     SAVE_IMG = True
     SAVE_IMG_GAP = 1000
 
+
+class EvidenceParams:
+    """Configuration for optional evidence-rich training reports."""
+
+    ENABLE_EVIDENCE_LOGGING = True
+    EVIDENCE_LOG_INTERVAL_STEPS = 3000
+    EVIDENCE_OUTPUT_DIR = './evidence_logs'
+    MAX_CASES_PER_REPORT = 20
+    MAX_CANDIDATES_PER_DECISION = 8
+    TOP_K_CANDIDATES = 5
+    LOW_CAPABILITY_THRESHOLD = 0.3
+    BETTER_ALTERNATIVE_GAP = 0.3
+    DEADLOCK_LOOKBACK_DECISIONS = 10
+
+
+class DeepSeekBiasParams:
+    """Window-level DeepSeek bias configuration; API keys are never stored here."""
+
+    ENABLE_DEEPSEEK_BIAS = True
+    DEEPSEEK_BIAS_UPDATE_INTERVAL_STEPS = 3000
+    DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
+    DEEPSEEK_MODEL = 'deepseek-v4-flash'
+    DEEPSEEK_TEMPERATURE = 0.0
+    DEEPSEEK_MAX_TOKENS = 1024
+    DEEPSEEK_TIMEOUT = 60
+    DEEPSEEK_USE_JSON_RESPONSE = True
+    DEEPSEEK_RESPONSE_OUTPUT_DIR = './evidence_logs/deepseek_responses'
+    BIAS_CONFIG_OUTPUT_DIR = './evidence_logs/bias_configs'
+    LLM_BIAS_EMA_ALPHA = 0.3
+    WEIGHT_RANGE = (-2.0, 2.0)
+    LAMBDA_RANGE = (0.0, 1.0)
+    CLIP_BOUND_RANGE = (-10.0, 10.0)
+

@@ -5,6 +5,7 @@ import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 from torch.cuda.amp.autocast_mode import autocast
 from parameters import *
+from utils.bias_manager import compute_capability_match_bias
 
 
 def get_attn_pad_mask(seq_q, seq_k):
@@ -45,7 +46,8 @@ class SingleHeadAttention(nn.Module):
             stdv = 1. / math.sqrt(param.size(-1))
             param.data.uniform_(-stdv, stdv)
 
-    def forward(self, q, h=None, mask=None):
+    def forward(self, q, h=None, mask=None, return_logits=False,
+                logit_bias=None):
         """
                 :param q: queries (batch_size, n_query, input_dim)
                 :param h: data (batch_size, graph_size, input_dim)
@@ -70,7 +72,14 @@ class SingleHeadAttention(nn.Module):
 
         U = self.norm_factor * torch.matmul(Q, K.transpose(1, 2))  # batch_size*n_query*targets_size
         U = self.tanh_clipping * torch.tanh(U)
+        raw_logits = U.clone() if return_logits == 'all' else None
 
+        if logit_bias is not None:
+            reshaped_bias = logit_bias.view(batch_size, -1, target_size)
+            U = U + reshaped_bias
+        else:
+            reshaped_bias = None
+        biased_logits = U.clone() if return_logits == 'all' else None
         if mask is not None:
             mask = mask.view(batch_size, -1, target_size).expand_as(U)  # copy for n_heads times
             U[mask.bool()] = -1e8
@@ -79,6 +88,12 @@ class SingleHeadAttention(nn.Module):
 
         probs = attention
 
+        if return_logits == 'all':
+            if reshaped_bias is None:
+                reshaped_bias = torch.zeros_like(raw_logits)
+            return probs, logp_list, U, raw_logits, reshaped_bias, biased_logits
+        if return_logits:
+            return probs, logp_list, U
         return probs, logp_list
 
 
@@ -285,7 +300,8 @@ class AttentionNet(nn.Module):
         aggregated_agents = torch.nanmean(compressed_task, dim=1).unsqueeze(1)
         return aggregated_agents, agents_encoding
 
-    def forward(self, tasks, agents, global_mask, index):
+    def forward(self, tasks, agents, global_mask, index, return_details=False,
+                capability_match=None, bias_params=None):
         task_mask = get_attn_pad_mask(tasks, tasks)
         agent_mask = get_attn_pad_mask(agents, agents)
         task_agent_mask = get_attn_pad_mask(tasks, agents)
@@ -297,9 +313,38 @@ class AttentionNet(nn.Module):
         current_state1 = torch.gather(agent_task_feature, 1, index.repeat(1, 1, agent_task_feature.size(2)))
         current_state = self.fusion(torch.cat((current_state1, aggregated_task, aggregated_agents), dim=-1))
         current_state_prime = self.globalDecoder(current_state, task_agent_feature, None, global_mask)
-        probs, logps = self.pointer(current_state_prime, task_agent_feature, mask=global_mask)
+        logit_bias = None
+        if (capability_match is not None and bias_params is not None
+                and torch.any(bias_params[:, 0] != 0)):
+            logit_bias = compute_capability_match_bias(
+                capability_match,
+                ~global_mask.bool(),
+                bias_params)
+        pointer_output = self.pointer(
+            current_state_prime,
+            task_agent_feature,
+            mask=global_mask,
+            return_logits=return_details,
+            logit_bias=logit_bias)
+        if return_details == 'all':
+            (probs, logps, logits, raw_logits, logit_bias,
+             biased_logits) = pointer_output
+        elif return_details:
+            probs, logps, logits = pointer_output
+        else:
+            probs, logps = pointer_output
         logps = logps.squeeze(1)
         probs = probs.squeeze(1)
+        if return_details == 'all':
+            return (
+                probs,
+                logps,
+                logits.squeeze(1),
+                raw_logits.squeeze(1),
+                logit_bias.squeeze(1),
+                biased_logits.squeeze(1))
+        if return_details:
+            return probs, logps, logits.squeeze(1)
         return probs, logps
 
 

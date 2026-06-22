@@ -326,13 +326,41 @@ class TaskEnv:
         else:
             return np.sum(np.array([self.agent_dic[member]['abilities'] for member in members]), axis=0)
 
+    @staticmethod
+    def compute_capability_match_from_existing_logic(agent_abilities, task_status):
+        """Return the binary contribution test used by the original ability mask.
+
+        capability_match is computed by reusing the original ability-mask
+        logic from env/task_env.py:get_contributable_task_mask.
+        """
+        effective_ability = np.maximum(np.minimum(task_status, agent_abilities), 0.)
+        return float(effective_ability.sum() > 0)
+
+    def get_capability_match(self, agent_id, task_id):
+        """Return the shared binary capability match for an agent-task pair."""
+        agent = self.agent_dic[agent_id]
+        task = self.task_dic[task_id]
+        return self.compute_capability_match_from_existing_logic(agent['abilities'], task['status'])
+
+    def get_capability_match_action_vector(self, agent_id, action_count=None):
+        """Return [depot, task matches, padding] for decoder action logits."""
+        values = [0.0]
+        values.extend(
+            self.get_capability_match(agent_id, task_id)
+            for task_id in range(self.tasks_num))
+        if action_count is not None:
+            values = values[:action_count]
+            values.extend([0.0] * max(0, action_count - len(values)))
+        return np.asarray(values, dtype=float)
+
     def get_contributable_task_mask(self, agent_id):
         agent = self.agent_dic[agent_id]
         contributable_task_mask = np.ones(self.tasks_num, dtype=bool)
         for task in self.task_dic.values():
             if not task['feasible_assignment']:
-                ability = np.maximum(np.minimum(task['status'], agent['abilities']), 0.)
-                if ability.sum() > 0:
+                capability_match = self.compute_capability_match_from_existing_logic(
+                    agent['abilities'], task['status'])
+                if capability_match > 0:
                     contributable_task_mask[task['ID']] = False
         return contributable_task_mask
 
