@@ -63,9 +63,9 @@ class DeepSeekBiasParams:
     """Window-level DeepSeek bias configuration; API keys are never stored here."""
 
     ENABLE_DEEPSEEK_BIAS = True
-    DEEPSEEK_BIAS_UPDATE_INTERVAL_STEPS = 3000
+    DEEPSEEK_BIAS_UPDATE_INTERVAL_STEPS = 30000
     DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
-    DEEPSEEK_MODEL = 'deepseek-v4-flash'
+    DEEPSEEK_MODEL = 'deepseek-v4-pro'
     DEEPSEEK_TEMPERATURE = 0.0
     DEEPSEEK_MAX_TOKENS = 4096
     DEEPSEEK_TIMEOUT = 120

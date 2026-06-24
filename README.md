@@ -41,8 +41,10 @@ evidence_logs/
   evidence_window_<start>_<end>.md
 ```
 
-The default window is 3000 effective training transitions. After a complete
-report is written, the main process may call DeepSeek once and cache the
+The default evidence window is 3000 effective training transitions. The
+DeepSeek update window is 30000 accepted transitions: reports are written at
+each small window, but the main process calls DeepSeek only at the larger
+update boundary, using all reports since the previous attempt, then caches the
 sanitized bias for subsequent worker jobs. Late Ray results carrying an older
 bias version are discarded, so accepted transitions in the next window use
 the synchronized snapshot. Model and decoder forward methods never perform

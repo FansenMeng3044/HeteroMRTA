@@ -16,7 +16,7 @@ DISABLED_BIAS_SNAPSHOT = {
     'raw_deepseek_weight': None,
     'raw_deepseek_lambda': None,
     'ema_alpha': 0.3,
-    'update_interval_steps': 3000,
+    'update_interval_steps': 30000,
 }
 
 
@@ -55,9 +55,9 @@ def normalize_bias_snapshot(snapshot=None):
         requested_apply = False
     try:
         normalized['update_interval_steps'] = max(
-            1, int(normalized.get('update_interval_steps') or 3000))
+            1, int(normalized.get('update_interval_steps') or 30000))
     except (TypeError, ValueError, OverflowError):
-        normalized['update_interval_steps'] = 3000
+        normalized['update_interval_steps'] = 30000
     normalized['ema_alpha'] = finite_float(
         normalized.get('ema_alpha'), 0.3)
     for field in ('raw_deepseek_weight', 'raw_deepseek_lambda'):
@@ -107,7 +107,7 @@ class BiasManager:
 
     def __init__(self, enabled=True, output_dir='./evidence_logs/bias_configs',
                  response_output_dir='./evidence_logs/deepseek_responses',
-                 ema_alpha=0.3, update_interval_steps=3000,
+                 ema_alpha=0.3, update_interval_steps=30000,
                  weight_range=(-2.0, 2.0), lambda_range=(0.0, 1.0),
                  clip_bound_range=(-10.0, 10.0)):
         self.enabled = bool(enabled)

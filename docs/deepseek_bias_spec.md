@@ -2,24 +2,25 @@
 
 ## Required Sequence
 
-The training process uses 3000 effective transitions per evidence window:
+The training process uses 3000 effective transitions per evidence window and 30000 effective transitions per DeepSeek update window:
 
 ```text
-train for one 3000-transition window
+train for one 3000-transition evidence window
 generate the evidence report
-call DeepSeek once from the main process
+repeat until 30000 accepted transitions have accumulated since the last DeepSeek attempt
+call DeepSeek once from the main process with all reports in that update window
 parse and sanitize the JSON response
 update the cached capability_match bias with EMA
 discard any late Ray result produced by an older snapshot
 use the new immutable snapshot for all accepted rollout work
-repeat at the next report boundary
+repeat at the next 30000-transition update boundary
 ```
 
 DeepSeek must never be called from a model, policy, attention, decoder, or
 forward method. Ray workers never own a DeepSeek client and never write
 DeepSeek response files.
 
-Each Ray result carries its bias version. If a window update succeeds while
+Each Ray result carries its bias version. If a DeepSeek update succeeds while
 older jobs are still in flight, their late results are discarded and those
 actors are resubmitted with the active snapshot. The job that reaches a
 boundary is accepted only up to the exact boundary; any overflow generated
@@ -37,9 +38,9 @@ max_cases_per_report: 20
 max_candidates_per_decision: 8
 
 enable_deepseek_bias: true
-deepseek_bias_update_interval_steps: 3000
+deepseek_bias_update_interval_steps: 30000
 deepseek_base_url: "https://api.deepseek.com"
-deepseek_model: "deepseek-v4-flash"
+deepseek_model: "deepseek-v4-pro"
 deepseek_temperature: 0.0
 deepseek_max_tokens: 4096
 deepseek_timeout: 120
@@ -55,7 +56,9 @@ configuration, prompts, responses, logs, exceptions, or checkpoints.
 
 ## API Frequency And Recovery
 
-- A report window can be claimed for at most one API attempt.
+- A DeepSeek update window can be claimed for at most one API attempt.
+- Evidence reports whose end step is below the next update boundary are recorded but do not trigger API attempts.
+- At an eligible update boundary, the prompt includes all evidence reports since the previous DeepSeek attempt.
 - The attempt marker is written before the network request, so a restart
   cannot repeat an uncertain request.
 - A successful response writes prompt, raw response, sanitized response, and
@@ -142,15 +145,17 @@ sampling order, rewards, buffers, or trajectories.
 ```text
 evidence_logs/
   evidence_window_00000000_00003000.md
-  evidence_window_00000000_00003000.json
+  evidence_window_00003000_00006000.md
+  ...
+  evidence_window_00027000_00030000.md
   deepseek_responses/
-    deepseek_prompt_00000000_00003000.txt
-    deepseek_raw_00000000_00003000.json
-    deepseek_sanitized_00000000_00003000.json
-    deepseek_warning_00000000_00003000.txt
-    deepseek_attempt_00000000_00003000.json
+    deepseek_prompt_00000000_00030000.txt
+    deepseek_raw_00000000_00030000.json
+    deepseek_sanitized_00000000_00030000.json
+    deepseek_warning_00000000_00030000.txt
+    deepseek_attempt_00000000_00030000.json
   bias_configs/
-    active_bias_config_00003000.json
+    active_bias_config_00030000.json
 ```
 
 A forced shutdown flush may write a partial report. On restart, its JSONL
@@ -159,8 +164,8 @@ records are reloaded and the same fixed window is continued to the next
 
 ## Acceptance Evidence
 
-Tests must cover one call per report, persistent deduplication, initial-off
+Tests must cover one call per update interval, skipped report-only windows, aggregated update prompts, persistent deduplication, initial-off
 behavior, EMA, sanitization, malformed output, timeout fallback, environment
 key handling, response files, snapshot restore, worker synchronization,
 rollout/training probability consistency, unchanged masks, disabled trajectory
-equivalence, 3000-step naming, and absence of network code in forward methods.
+equivalence, 3000-step evidence naming, 30000-step DeepSeek update naming, and absence of network code in forward methods.

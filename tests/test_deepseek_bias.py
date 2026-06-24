@@ -90,12 +90,12 @@ class BiasManagerTest(unittest.TestCase):
         self.assertEqual(8, EvidenceParams.MAX_CANDIDATES_PER_DECISION)
         self.assertTrue(DeepSeekBiasParams.ENABLE_DEEPSEEK_BIAS)
         self.assertEqual(
-            3000, DeepSeekBiasParams.DEEPSEEK_BIAS_UPDATE_INTERVAL_STEPS)
+            30000, DeepSeekBiasParams.DEEPSEEK_BIAS_UPDATE_INTERVAL_STEPS)
         self.assertEqual(
             'https://api.deepseek.com',
             DeepSeekBiasParams.DEEPSEEK_BASE_URL)
         self.assertEqual(
-            'deepseek-v4-flash', DeepSeekBiasParams.DEEPSEEK_MODEL)
+            'deepseek-v4-pro', DeepSeekBiasParams.DEEPSEEK_MODEL)
         self.assertEqual(0.0, DeepSeekBiasParams.DEEPSEEK_TEMPERATURE)
         self.assertEqual(4096, DeepSeekBiasParams.DEEPSEEK_MAX_TOKENS)
         self.assertEqual(120, DeepSeekBiasParams.DEEPSEEK_TIMEOUT)
@@ -273,6 +273,65 @@ class DeepSeekBiasControllerTest(unittest.TestCase):
             'evidence_window_{:08d}_{:08d}.md'.format(start, end))
         report.write_text('report evidence', encoding='utf-8')
         return report
+
+    def test_reports_are_aggregated_until_update_interval(self):
+        calls = []
+
+        def transport(url, headers, payload, timeout):
+            calls.append(payload)
+            return {
+                'choices': [{
+                    'message': {'content': json.dumps(VALID_RAW_CONFIG)}
+                }]
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            responses = root / 'responses'
+            manager = BiasManager(
+                output_dir=root / 'bias',
+                response_output_dir=responses)
+            client = DeepSeekClient(
+                'https://api.deepseek.com',
+                'deepseek-v4-flash',
+                transport=transport)
+            reports = [
+                self._report(root, start, start + 3000)
+                for start in range(0, 30000, 3000)
+            ]
+            with mock.patch.dict(
+                    os.environ, {'DEEPSEEK_API_KEY': 'secret'}):
+                controller = DeepSeekBiasController(
+                    True, client, manager, responses, 30000)
+                for report in reports[:-1]:
+                    snapshot, updated = controller.process_report(report)
+                    self.assertFalse(updated)
+                    self.assertFalse(snapshot['apply_bias'])
+                self.assertEqual([], calls)
+
+                snapshot, updated = controller.process_report(reports[-1])
+
+            self.assertTrue(updated)
+            self.assertTrue(snapshot['apply_bias'])
+            self.assertEqual(1, len(calls))
+            prompt = calls[0]['messages'][0]['content']
+            self.assertIn('DeepSeek bias update window: (0, 30000]', prompt)
+            self.assertIn(
+                'evidence_window_00000000_00003000.md', prompt)
+            self.assertIn(
+                'evidence_window_00027000_00030000.md', prompt)
+            attempt = json.loads((
+                responses / 'deepseek_attempt_00000000_00030000.json'
+            ).read_text(encoding='utf-8'))
+            sanitized = json.loads((
+                responses / 'deepseek_sanitized_00000000_00030000.json'
+            ).read_text(encoding='utf-8'))
+            expected_sources = [report.name for report in reports]
+            self.assertEqual(expected_sources, attempt['source_reports'])
+            self.assertEqual(expected_sources, sanitized['source_reports'])
+            self.assertTrue((
+                root / 'bias' / 'active_bias_config_00030000.json'
+            ).exists())
 
     def test_one_call_per_window_and_restart_dedup(self):
         calls = []
