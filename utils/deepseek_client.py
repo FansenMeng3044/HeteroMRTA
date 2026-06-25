@@ -5,7 +5,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from utils.bias_manager import EXPLICIT_BIAS_FEATURES, zero_feature_weights
+from utils.bias_manager import EXPLICIT_BIAS_FEATURES
 
 
 class DeepSeekResponseTruncated(RuntimeError):
@@ -43,23 +43,60 @@ class DeepSeekClient:
     @staticmethod
     def build_prompt(report_text):
         schema = {
-            'weights': zero_feature_weights(),
-            'lambda': 0.0,
+            'weights': {
+                'completion_potential': 0.8,
+                'requirement_reduction_ratio': 0.4,
+                'travel_time': -0.5,
+                'waiting_pressure': 0.3,
+            },
+            'lambda': 0.25,
             'clip_range': [-2.0, 2.0],
             'rationale': {
-                'main_failure_modes': [],
-                'expected_effect': [],
+                'main_failure_modes': ['short strings'],
+                'expected_effect': ['short strings'],
             },
         }
+        guidance = (
+            'Decision rules:\n'
+            '- Treat capability_match as a diagnostic only; the valid-action '
+            'mask often makes capability_match non-discriminative.\n'
+            '- The optimization objective is shorter successful-episode '
+            'makespan and lower waiting time; success_rate=1.0 is not a '
+            'reason to return zero by itself.\n'
+            '- Focus on explicit_feature_failure_signal, time_quality_signal, '
+            'llm_bias_guidance, current_policy_diagnosis, and the '
+            'representative cases.\n'
+            '- Return all-zero weights and lambda=0 only when the explicit '
+            'feature signal shows no actionable failure direction.\n'
+            '- If depot_with_completion_candidate or missed_completion_potential '
+            'is nonzero, use a positive completion_potential weight and '
+            'lambda > 0.\n'
+            '- If missed_requirement_reduction is nonzero, use a positive '
+            'requirement_reduction_ratio weight.\n'
+            '- If long_travel_choice is nonzero, use a negative travel_time '
+            'weight.\n'
+            '- If missed_waiting_pressure is nonzero, use a positive '
+            'waiting_pressure weight.\n'
+            '- If time_quality_signal says time_optimization_needed=true, '
+            'return nonzero bias even when success_rate is 1.0. Use negative '
+            'travel_time when slow successful episodes have higher travel_time; '
+            'use positive completion/reduction/waiting weights when fast '
+            'successful episodes have higher values for those features.\n'
+            '- If any weight is nonzero, lambda must also be nonzero, typically '
+            'between 0.1 and 0.4 for this first-pass bias.\n'
+            '- Numeric fields must be JSON numbers, not strings. The JSON '
+            'shape below is an illustrative nonzero example, not a default.\n')
         return (
             'Analyze the evidence report below and return only one JSON object. '
             'The allowed decoder-bias features are: '
             + ', '.join(EXPLICIT_BIAS_FEATURES)
-            + '. Use this exact schema and do not add other feature keys:\\n'
+            + '. Do not add other feature keys.\n'
+            + guidance
+            + 'Required JSON shape:\n'
             + json.dumps(schema, separators=(',', ':'))
-            + '\\n\\n'
-            'EVIDENCE REPORT\\n'
-            '================\\n'
+            + '\n\n'
+            'EVIDENCE REPORT\n'
+            '================\n'
             + report_text)
 
     def request_bias_config(self, report_path, prompt=None):

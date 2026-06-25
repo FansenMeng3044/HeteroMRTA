@@ -10,10 +10,25 @@ from utils.evidence_recorder import (
 )
 
 
-def make_decision(chosen_match=0.0, alternative_match=1.0):
+def make_decision(chosen_match=0.0, alternative_match=1.0, episode_id=10,
+                  eventual_success=False, eventual_deadlock=True,
+                  eventual_makespan=10.0, chosen_features=None,
+                  alternative_features=None):
+    chosen_features = chosen_features or {
+        'completion_potential': 0.0,
+        'requirement_reduction_ratio': chosen_match,
+        'travel_time': 0.25,
+        'waiting_pressure': 0.0,
+    }
+    alternative_features = alternative_features or {
+        'completion_potential': 1.0,
+        'requirement_reduction_ratio': alternative_match,
+        'travel_time': 0.1,
+        'waiting_pressure': 0.5,
+    }
     return {
         'decision_id': 0,
-        'episode_id': 10,
+        'episode_id': episode_id,
         'current_agent_id': 1,
         'current_agent_species': 0,
         'current_agent_skill_vector': [1, 0],
@@ -24,9 +39,9 @@ def make_decision(chosen_match=0.0, alternative_match=1.0):
         'chosen_task_state': 'open',
         'model_entropy': 0.5,
         'valid_action_count': 3,
-        'eventual_episode_success': False,
-        'eventual_deadlock': True,
-        'eventual_makespan': 10.0,
+        'eventual_episode_success': eventual_success,
+        'eventual_deadlock': eventual_deadlock,
+        'eventual_makespan': eventual_makespan,
         'eventual_awt': 2.0,
         'eventual_awar': None,
         'candidates': [
@@ -42,12 +57,7 @@ def make_decision(chosen_match=0.0, alternative_match=1.0):
                 'model_prob': 0.6,
                 'remaining_requirement': [1, 0],
                 'original_requirement': [1, 0],
-                'explicit_features': {
-                    'completion_potential': 0.0,
-                    'requirement_reduction_ratio': chosen_match,
-                    'travel_time': 0.25,
-                    'waiting_pressure': 0.0,
-                },
+                'explicit_features': chosen_features,
                 'capability_match': chosen_match,
             },
             {
@@ -62,12 +72,7 @@ def make_decision(chosen_match=0.0, alternative_match=1.0):
                 'model_prob': 0.4,
                 'remaining_requirement': [0, 1],
                 'original_requirement': [0, 1],
-                'explicit_features': {
-                    'completion_potential': 1.0,
-                    'requirement_reduction_ratio': alternative_match,
-                    'travel_time': 0.1,
-                    'waiting_pressure': 0.5,
-                },
+                'explicit_features': alternative_features,
                 'capability_match': alternative_match,
             },
         ],
@@ -93,8 +98,18 @@ def make_decision(chosen_match=0.0, alternative_match=1.0):
             'capability_match': [0.0, chosen_match, alternative_match],
             'explicit_features': [
                 [0.0, 0.0, 0.0, 0.0],
-                [0.0, chosen_match, 0.25, 0.0],
-                [1.0, alternative_match, 0.1, 0.5],
+                [
+                    chosen_features['completion_potential'],
+                    chosen_features['requirement_reduction_ratio'],
+                    chosen_features['travel_time'],
+                    chosen_features['waiting_pressure'],
+                ],
+                [
+                    alternative_features['completion_potential'],
+                    alternative_features['requirement_reduction_ratio'],
+                    alternative_features['travel_time'],
+                    alternative_features['waiting_pressure'],
+                ],
             ],
             'raw_decoder_logits': [0.0, 0.2, 0.1],
             'explicit_feature_logit_bias': [0.0, 0.0, 0.05],
@@ -202,14 +217,21 @@ class EvidenceRecorderTest(unittest.TestCase):
                 2,
                 report['failure_mode_distribution'][
                     'missed_better_capability_alternative']['count'])
+            explicit_signal = report['explicit_feature_failure_signal']
             self.assertEqual(
-                {
-                    'completion_potential': 0.0,
-                    'requirement_reduction_ratio': 0.0,
-                    'travel_time': 0.0,
-                    'waiting_pressure': 0.0,
-                },
-                report['recommended_llm_output_format']['weights'])
+                2, explicit_signal['missed_completion_potential']['count'])
+            self.assertEqual(
+                2, explicit_signal['missed_requirement_reduction']['count'])
+            self.assertEqual(
+                2, explicit_signal['missed_waiting_pressure']['count'])
+            self.assertTrue(
+                report['llm_bias_guidance']['should_return_nonzero_bias'])
+            weights = report['recommended_llm_output_format']['weights']
+            self.assertGreater(weights['completion_potential'], 0.0)
+            self.assertGreater(weights['requirement_reduction_ratio'], 0.0)
+            self.assertGreater(weights['waiting_pressure'], 0.0)
+            self.assertGreater(
+                report['recommended_llm_output_format']['lambda'], 0.0)
             failed_case = report['representative_failed_decision_cases'][0]
             self.assertIn('decoder_logit_debug', failed_case)
             self.assertEqual(
@@ -225,12 +247,95 @@ class EvidenceRecorderTest(unittest.TestCase):
             markdown = (
                 Path(temp_dir) / 'evidence_window_00000000_00000002.md'
             ).read_text(encoding='utf-8')
-            for section in 'ABCDEFGH':
+            for section in 'ABCDEFGHI':
                 self.assertIn('## {}.'.format(section), markdown)
+            self.assertIn('Explicit feature failure and time-quality signals', markdown)
+            self.assertIn('Suggested weights', markdown)
+            self.assertIn('lambda > 0', markdown)
             self.assertIn('Raw decoder logits', markdown)
             self.assertIn('Explicit feature logit bias', markdown)
             self.assertIn('Biased decoder logits', markdown)
 
+    def test_successful_time_quality_signal_suggests_time_bias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = EvidenceRecorder(
+                interval_steps=2,
+                output_dir=temp_dir,
+                max_cases_per_report=2)
+            fast_features = {
+                'completion_potential': 1.0,
+                'requirement_reduction_ratio': 1.0,
+                'travel_time': 0.1,
+                'waiting_pressure': 0.5,
+            }
+            slow_features = {
+                'completion_potential': 0.2,
+                'requirement_reduction_ratio': 0.4,
+                'travel_time': 0.7,
+                'waiting_pressure': 0.0,
+            }
+            fast_episode = make_episode(1, success=True, deadlock=False)
+            fast_episode.update({
+                'final_makespan': 20.0,
+                'average_waiting_time': 1.0,
+                'reward': -21.0,
+            })
+            slow_episode = make_episode(2, success=True, deadlock=False)
+            slow_episode.update({
+                'final_makespan': 80.0,
+                'average_waiting_time': 12.0,
+                'reward': -92.0,
+            })
+            recorder.record_episode_payload({
+                'episode': fast_episode,
+                'decisions': [make_decision(
+                    1.0,
+                    1.0,
+                    episode_id=1,
+                    eventual_success=True,
+                    eventual_deadlock=False,
+                    eventual_makespan=20.0,
+                    chosen_features=fast_features,
+                    alternative_features=fast_features)],
+            })
+            recorder.record_episode_payload({
+                'episode': slow_episode,
+                'decisions': [make_decision(
+                    1.0,
+                    1.0,
+                    episode_id=2,
+                    eventual_success=True,
+                    eventual_deadlock=False,
+                    eventual_makespan=80.0,
+                    chosen_features=slow_features,
+                    alternative_features=slow_features)],
+            })
+
+            report = json.loads((
+                Path(temp_dir) / 'evidence_window_00000000_00000002.json'
+            ).read_text(encoding='utf-8'))
+            self.assertEqual(1.0, report['global_training_trend']['success_rate'])
+            time_signal = report['time_quality_signal']
+            self.assertTrue(time_signal['all_recorded_episodes_successful'])
+            self.assertTrue(time_signal['time_optimization_needed'])
+            self.assertEqual(60.0, time_signal['slow_minus_fast']['makespan'])
+            self.assertEqual(
+                'negative',
+                time_signal['feature_weight_directions']['travel_time'])
+            weights = report['recommended_llm_output_format']['weights']
+            self.assertLess(weights['travel_time'], 0.0)
+            self.assertGreater(weights['completion_potential'], 0.0)
+            self.assertGreater(
+                report['recommended_llm_output_format']['lambda'], 0.0)
+            slow_case = report['representative_failed_decision_cases'][0]
+            self.assertTrue(slow_case['final_outcome']['success'])
+
+            markdown = (
+                Path(temp_dir) / 'evidence_window_00000000_00000002.md'
+            ).read_text(encoding='utf-8')
+            self.assertIn('Successful-episode time-quality signal', markdown)
+            self.assertIn('Time optimization needed: yes', markdown)
+            self.assertIn('Success alone is not the target', markdown)
     def test_partial_window_flush_and_previous_window_change(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = EvidenceRecorder(interval_steps=2, output_dir=temp_dir)

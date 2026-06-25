@@ -271,6 +271,22 @@ class DeepSeekClientTest(unittest.TestCase):
         self.assertEqual(
             'Bearer secret-value', captured['headers']['Authorization'])
 
+    def test_prompt_uses_explicit_feature_signals_for_nonzero_bias(self):
+        prompt = DeepSeekClient.build_prompt(
+            'explicit_feature_failure_signal: '
+            'depot_with_completion_candidate count=3; '
+            'missed_completion_potential count=3; '
+            'time_quality_signal: success_rate=1.0, '
+            'time_optimization_needed=true')
+        self.assertIn('explicit_feature_failure_signal', prompt)
+        self.assertIn('time_quality_signal', prompt)
+        self.assertIn('success_rate=1.0 is not a reason to return zero', prompt)
+        self.assertIn('lambda > 0', prompt)
+        self.assertIn('positive completion_potential weight', prompt)
+        self.assertIn('return nonzero bias even when success_rate is 1.0', prompt)
+        self.assertIn('Return all-zero weights and lambda=0 only when', prompt)
+        self.assertNotIn('"completion_potential":0.0', prompt)
+
     def test_missing_key_fails_before_transport(self):
         client = DeepSeekClient(
             'https://api.deepseek.com',

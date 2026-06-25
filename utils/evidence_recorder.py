@@ -413,6 +413,62 @@ class EvidenceRecorder:
                 return candidate
         return None
 
+    @staticmethod
+    def _feature_value(candidate, feature):
+        features = candidate.get('explicit_features') or {}
+        value = features.get(feature)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+        return None
+
+    @staticmethod
+    def _rate_value(count, total):
+        return count / total if total else None
+
+    @staticmethod
+    def _valid_task_candidates(decision):
+        return [
+            candidate for candidate in decision.get('candidates', [])
+            if candidate.get('is_valid') and candidate.get('task_id') is not None
+        ]
+
+    def _best_candidate_feature(self, candidates, feature):
+        values = [
+            self._feature_value(candidate, feature) for candidate in candidates]
+        values = [value for value in values if value is not None]
+        if not values:
+            return None
+        if feature == 'travel_time':
+            return min(values)
+        return max(values)
+
+    def _feature_means(self, decisions, best_valid=False):
+        sums = zero_feature_weights()
+        counts = {feature: 0 for feature in EXPLICIT_BIAS_FEATURES}
+        for decision in decisions:
+            if best_valid:
+                candidates = self._valid_task_candidates(decision)
+                if not candidates:
+                    continue
+            else:
+                candidate = self._chosen_candidate(decision)
+                if candidate is None:
+                    continue
+            for feature in EXPLICIT_BIAS_FEATURES:
+                if best_valid:
+                    value = self._best_candidate_feature(candidates, feature)
+                else:
+                    value = self._feature_value(candidate, feature)
+                if value is None:
+                    continue
+                sums[feature] += value
+                counts[feature] += 1
+        return {
+            feature: (sums[feature] / counts[feature]
+                      if counts[feature] else None)
+            for feature in EXPLICIT_BIAS_FEATURES
+        }
+
     def _decision_flags(self, decision):
         chosen = self._chosen_candidate(decision)
         if not chosen or chosen.get('capability_match') is None:
@@ -509,6 +565,398 @@ class EvidenceRecorder:
         cases.sort(key=lambda item: item[0], reverse=True)
         return [case for _, case in cases[:self.max_cases_per_report]]
 
+    def _explicit_feature_signal_metrics(self, decisions, high_ids, low_ids):
+        thresholds = {
+            'completion_potential_high': 0.5,
+            'completion_gap': 0.5,
+            'requirement_reduction_gap': 0.4,
+            'travel_time_gap': 0.25,
+            'waiting_pressure_gap': 0.25,
+        }
+        total_decisions = len(decisions)
+        decisions_with_candidates = 0
+        depot_choice_count = 0
+        depot_with_completion_count = 0
+        missed_completion_count = 0
+        missed_reduction_count = 0
+        long_travel_count = 0
+        missed_waiting_count = 0
+
+        for decision in decisions:
+            chosen = self._chosen_candidate(decision)
+            if chosen is None:
+                continue
+            valid_tasks = self._valid_task_candidates(decision)
+            if not valid_tasks:
+                continue
+            decisions_with_candidates += 1
+            chosen_is_depot = (
+                chosen.get('task_id') is None or chosen.get('action_index') == 0)
+            if chosen_is_depot:
+                depot_choice_count += 1
+
+            best_completion = self._best_candidate_feature(
+                valid_tasks, 'completion_potential')
+            best_reduction = self._best_candidate_feature(
+                valid_tasks, 'requirement_reduction_ratio')
+            nearest_travel = self._best_candidate_feature(
+                valid_tasks, 'travel_time')
+            best_waiting = self._best_candidate_feature(
+                valid_tasks, 'waiting_pressure')
+
+            chosen_completion = self._feature_value(
+                chosen, 'completion_potential')
+            chosen_reduction = self._feature_value(
+                chosen, 'requirement_reduction_ratio')
+            chosen_travel = self._feature_value(chosen, 'travel_time')
+            chosen_waiting = self._feature_value(chosen, 'waiting_pressure')
+
+            if chosen_is_depot:
+                chosen_completion = 0.0 if chosen_completion is None else chosen_completion
+                chosen_reduction = 0.0 if chosen_reduction is None else chosen_reduction
+                chosen_waiting = 0.0 if chosen_waiting is None else chosen_waiting
+
+            if (best_completion is not None
+                    and best_completion >= thresholds['completion_potential_high']):
+                if chosen_is_depot:
+                    depot_with_completion_count += 1
+                if (chosen_completion is not None
+                        and best_completion - chosen_completion
+                        >= thresholds['completion_gap']):
+                    missed_completion_count += 1
+
+            if (best_reduction is not None and chosen_reduction is not None
+                    and best_reduction - chosen_reduction
+                    >= thresholds['requirement_reduction_gap']):
+                missed_reduction_count += 1
+
+            if (not chosen_is_depot and nearest_travel is not None
+                    and chosen_travel is not None
+                    and chosen_travel - nearest_travel
+                    >= thresholds['travel_time_gap']):
+                long_travel_count += 1
+
+            if (best_waiting is not None and chosen_waiting is not None
+                    and best_waiting - chosen_waiting
+                    >= thresholds['waiting_pressure_gap']):
+                missed_waiting_count += 1
+
+        high_decisions = [
+            decision for decision in decisions
+            if decision.get('episode_id') in high_ids]
+        low_decisions = [
+            decision for decision in decisions
+            if decision.get('episode_id') in low_ids]
+        return {
+            'decision_count': total_decisions,
+            'decisions_with_valid_task_candidates': decisions_with_candidates,
+            'depot_choice': {
+                'count': depot_choice_count,
+                'rate': self._rate_value(depot_choice_count, total_decisions),
+            },
+            'depot_with_completion_candidate': {
+                'count': depot_with_completion_count,
+                'rate_among_depot_choices': self._rate_value(
+                    depot_with_completion_count, depot_choice_count),
+                'rate_among_all_decisions': self._rate_value(
+                    depot_with_completion_count, total_decisions),
+            },
+            'missed_completion_potential': {
+                'count': missed_completion_count,
+                'rate': self._rate_value(
+                    missed_completion_count, decisions_with_candidates),
+            },
+            'missed_requirement_reduction': {
+                'count': missed_reduction_count,
+                'rate': self._rate_value(
+                    missed_reduction_count, decisions_with_candidates),
+            },
+            'long_travel_choice': {
+                'count': long_travel_count,
+                'rate': self._rate_value(
+                    long_travel_count, decisions_with_candidates),
+            },
+            'missed_waiting_pressure': {
+                'count': missed_waiting_count,
+                'rate': self._rate_value(
+                    missed_waiting_count, decisions_with_candidates),
+            },
+            'chosen_feature_means': {
+                'all_decisions': self._feature_means(decisions),
+                'high_quality_decisions': self._feature_means(high_decisions),
+                'low_quality_or_failed_decisions': self._feature_means(
+                    low_decisions),
+            },
+            'best_valid_feature_means': {
+                'all_decisions': self._feature_means(
+                    decisions, best_valid=True),
+            },
+            'thresholds': thresholds,
+        }
+
+    def _time_quality_signal_metrics(self, decisions, episodes):
+        thresholds = {
+            'makespan_gap_min': 1.0,
+            'makespan_relative_gap': 0.05,
+            'feature_mean_gap': 0.05,
+        }
+        successful = [
+            episode for episode in episodes
+            if episode.get('success')
+            and isinstance(episode.get('final_makespan'), (int, float))
+            and math.isfinite(float(episode.get('final_makespan')))]
+        successful.sort(key=lambda episode: episode['final_makespan'])
+        group_size = (
+            max(1, int(math.ceil(len(successful) * 0.2)))
+            if successful else 0)
+        fastest = successful[:group_size]
+        slowest = successful[-group_size:] if group_size else []
+        fastest_ids = {episode['episode_id'] for episode in fastest}
+        slowest_ids = {episode['episode_id'] for episode in slowest}
+        fastest_decisions = [
+            decision for decision in decisions
+            if decision.get('episode_id') in fastest_ids]
+        slowest_decisions = [
+            decision for decision in decisions
+            if decision.get('episode_id') in slowest_ids]
+        fastest_features = self._feature_means(fastest_decisions)
+        slowest_features = self._feature_means(slowest_decisions)
+        feature_gap = {}
+        for feature in EXPLICIT_BIAS_FEATURES:
+            fast_value = fastest_features.get(feature)
+            slow_value = slowest_features.get(feature)
+            feature_gap[feature] = (
+                slow_value - fast_value
+                if isinstance(fast_value, (int, float))
+                and isinstance(slow_value, (int, float)) else None)
+
+        fastest_makespan = self._mean(fastest, 'final_makespan')
+        slowest_makespan = self._mean(slowest, 'final_makespan')
+        fastest_waiting = self._mean(fastest, 'average_waiting_time')
+        slowest_waiting = self._mean(slowest, 'average_waiting_time')
+        makespan_gap = (
+            slowest_makespan - fastest_makespan
+            if isinstance(fastest_makespan, (int, float))
+            and isinstance(slowest_makespan, (int, float)) else None)
+        relative_gap = (
+            makespan_gap / max(abs(fastest_makespan), 1e-9)
+            if isinstance(makespan_gap, (int, float))
+            and isinstance(fastest_makespan, (int, float)) else None)
+        waiting_gap = (
+            slowest_waiting - fastest_waiting
+            if isinstance(fastest_waiting, (int, float))
+            and isinstance(slowest_waiting, (int, float)) else None)
+        time_optimization_needed = bool(
+            len(successful) >= 2
+            and isinstance(makespan_gap, (int, float))
+            and isinstance(relative_gap, (int, float))
+            and makespan_gap >= thresholds['makespan_gap_min']
+            and relative_gap >= thresholds['makespan_relative_gap'])
+
+        directions = {}
+        gap_threshold = thresholds['feature_mean_gap']
+        if time_optimization_needed:
+            travel_gap = feature_gap.get('travel_time')
+            if isinstance(travel_gap, (int, float)) and travel_gap >= gap_threshold:
+                directions['travel_time'] = 'negative'
+            completion_gap = feature_gap.get('completion_potential')
+            if (isinstance(completion_gap, (int, float))
+                    and completion_gap <= -gap_threshold):
+                directions['completion_potential'] = 'positive'
+            reduction_gap = feature_gap.get('requirement_reduction_ratio')
+            if (isinstance(reduction_gap, (int, float))
+                    and reduction_gap <= -gap_threshold):
+                directions['requirement_reduction_ratio'] = 'positive'
+            waiting_gap_feature = feature_gap.get('waiting_pressure')
+            if (isinstance(waiting_gap_feature, (int, float))
+                    and waiting_gap_feature <= -gap_threshold):
+                directions['waiting_pressure'] = 'positive'
+
+        return {
+            'objective': 'minimize successful-episode makespan and waiting time, not only maximize success rate',
+            'successful_episode_count': len(successful),
+            'all_recorded_episodes_successful': bool(
+                episodes and len(successful) == len(episodes)),
+            'group_size': group_size,
+            'fastest_successful_episode_ids': sorted(fastest_ids),
+            'slowest_successful_episode_ids': sorted(slowest_ids),
+            'fastest_successful_metrics': {
+                'average_makespan': fastest_makespan,
+                'average_waiting_time': fastest_waiting,
+                'average_reward': self._mean(fastest, 'reward'),
+            },
+            'slowest_successful_metrics': {
+                'average_makespan': slowest_makespan,
+                'average_waiting_time': slowest_waiting,
+                'average_reward': self._mean(slowest, 'reward'),
+            },
+            'slow_minus_fast': {
+                'makespan': makespan_gap,
+                'makespan_relative': relative_gap,
+                'average_waiting_time': waiting_gap,
+                'chosen_feature_means': feature_gap,
+            },
+            'fastest_chosen_feature_means': fastest_features,
+            'slowest_chosen_feature_means': slowest_features,
+            'feature_weight_directions': directions,
+            'time_optimization_needed': time_optimization_needed,
+            'thresholds': thresholds,
+        }
+
+    def _llm_bias_guidance(self, trend, explicit_signal, time_quality_signal):
+        suggested_weights = zero_feature_weights()
+        main_failure_modes = []
+        expected_effect = []
+
+        completion_count = (
+            explicit_signal['depot_with_completion_candidate']['count']
+            + explicit_signal['missed_completion_potential']['count'])
+        if completion_count:
+            suggested_weights['completion_potential'] = 0.8
+            suggested_weights['requirement_reduction_ratio'] = max(
+                suggested_weights['requirement_reduction_ratio'], 0.4)
+            main_failure_modes.append(
+                'completion-ready valid tasks were ignored or depot was selected while one was available')
+            expected_effect.append(
+                'increase logits for actions that can immediately close a task requirement')
+
+        if explicit_signal['missed_requirement_reduction']['count']:
+            suggested_weights['requirement_reduction_ratio'] = max(
+                suggested_weights['requirement_reduction_ratio'], 0.6)
+            main_failure_modes.append(
+                'chosen actions often reduced less remaining requirement than another valid candidate')
+            expected_effect.append(
+                'prefer actions that reduce more of the remaining task requirement')
+
+        if explicit_signal['long_travel_choice']['count']:
+            suggested_weights['travel_time'] = min(
+                suggested_weights['travel_time'], -0.5)
+            main_failure_modes.append(
+                'chosen task actions were farther than another valid candidate')
+            expected_effect.append(
+                'penalize unnecessarily long travel among otherwise valid tasks')
+
+        if explicit_signal['missed_waiting_pressure']['count']:
+            suggested_weights['waiting_pressure'] = max(
+                suggested_weights['waiting_pressure'], 0.3)
+            main_failure_modes.append(
+                'chosen actions ignored candidates with higher waiting pressure')
+            expected_effect.append(
+                'prioritize tasks where agents are already waiting for coalition completion')
+
+        if time_quality_signal.get('time_optimization_needed'):
+            gap = time_quality_signal.get('slow_minus_fast', {})
+            main_failure_modes.append(
+                'success rate can be high while slow successful episodes still have larger makespan')
+            expected_effect.append(
+                'optimize for shorter makespan and lower waiting time even when all tasks finish')
+            directions = time_quality_signal.get('feature_weight_directions', {})
+            if directions.get('travel_time') == 'negative':
+                suggested_weights['travel_time'] = min(
+                    suggested_weights['travel_time'], -0.6)
+                expected_effect.append(
+                    'make slow high-travel successful decisions less likely')
+            if directions.get('completion_potential') == 'positive':
+                suggested_weights['completion_potential'] = max(
+                    suggested_weights['completion_potential'], 0.6)
+            if directions.get('requirement_reduction_ratio') == 'positive':
+                suggested_weights['requirement_reduction_ratio'] = max(
+                    suggested_weights['requirement_reduction_ratio'], 0.5)
+            if directions.get('waiting_pressure') == 'positive':
+                suggested_weights['waiting_pressure'] = max(
+                    suggested_weights['waiting_pressure'], 0.3)
+            if not directions and not any(
+                    value != 0.0 for value in suggested_weights.values()):
+                suggested_weights['travel_time'] = -0.3
+                expected_effect.append(
+                    'conservatively favor shorter-travel choices to test makespan improvement')
+            main_failure_modes.append(
+                'slow-minus-fast makespan gap is {}'.format(
+                    self._format_value(gap.get('makespan'))))
+
+        should_return_nonzero = any(
+            value != 0.0 for value in suggested_weights.values())
+        return {
+            'should_return_nonzero_bias': should_return_nonzero,
+            'suggested_weights': suggested_weights,
+            'suggested_lambda': 0.25 if should_return_nonzero else 0.0,
+            'suggested_clip_range': [-2.0, 2.0],
+            'main_failure_modes': main_failure_modes,
+            'expected_effect': expected_effect,
+            'success_rate': trend.get('success_rate'),
+            'timeout_rate': trend.get('timeout_rate'),
+            'deadlock_rate': trend.get('deadlock_rate'),
+            'time_optimization_needed': time_quality_signal.get(
+                'time_optimization_needed'),
+        }
+
+    def _diagnose_policy(self, missed_count, low_count, deadlock_tail_count,
+                         high_metrics, low_metrics, explicit_signal,
+                         time_quality_signal, llm_guidance):
+        diagnosis_parts = []
+        if missed_count:
+            diagnosis_parts.append(
+                'The capability diagnostic still finds choices with lower '
+                'capability_match than another valid alternative.')
+            high_missed_rate = high_metrics.get('missed_better_alternative_rate')
+            low_missed_rate = low_metrics.get('missed_better_alternative_rate')
+            if (isinstance(high_missed_rate, (int, float))
+                    and isinstance(low_missed_rate, (int, float))
+                    and low_missed_rate > high_missed_rate):
+                diagnosis_parts.append(
+                    'This capability pattern is more frequent in failed or '
+                    'low-quality episodes than in high-quality episodes.')
+            if deadlock_tail_count:
+                diagnosis_parts.append(
+                    'Repeated poor-match choices also appear shortly before '
+                    'deadlock in this window.')
+        elif low_count:
+            diagnosis_parts.append(
+                'The capability diagnostic sees some low capability_match '
+                'choices, but not a consistent higher-match valid alternative.')
+        else:
+            diagnosis_parts.append(
+                'Capability_match is not a useful failure discriminator in '
+                'this window because valid task candidates are already '
+                'contributable under the mask.')
+
+        if time_quality_signal.get('time_optimization_needed'):
+            gap = time_quality_signal.get('slow_minus_fast', {})
+            diagnosis_parts.append(
+                'Success alone is not the target: slow successful episodes are '
+                'still slower than fast successful episodes by makespan {} '
+                'and waiting time {}.'.format(
+                    self._format_value(gap.get('makespan')),
+                    self._format_value(gap.get('average_waiting_time'))))
+
+        if llm_guidance['should_return_nonzero_bias']:
+            signal_parts = []
+            for key, label in (
+                    ('depot_with_completion_candidate',
+                     'depot choices while completion-ready tasks existed'),
+                    ('missed_completion_potential',
+                     'missed completion-potential alternatives'),
+                    ('missed_requirement_reduction',
+                     'missed higher requirement-reduction alternatives'),
+                    ('long_travel_choice', 'unnecessarily long-travel choices'),
+                    ('missed_waiting_pressure',
+                     'missed higher waiting-pressure alternatives')):
+                count = explicit_signal[key]['count']
+                if count:
+                    signal_parts.append('{} {}'.format(count, label))
+            diagnosis_parts.append(
+                'Explicit decoder-bias features do show actionable signals: '
+                + '; '.join(signal_parts) + '.')
+            diagnosis_parts.append(
+                'DeepSeek should consider non-zero feature weights with '
+                'lambda > 0 instead of returning the all-zero no-op config.')
+        else:
+            diagnosis_parts.append(
+                'The explicit feature aggregate does not show a strong '
+                'actionable bias direction in this window, so an all-zero '
+                'bias may be reasonable.')
+        return ' '.join(diagnosis_parts)
+
     def _build_report(self, start_step, end_step, decisions, episodes):
         trend = {
             'episode_count': len(episodes),
@@ -566,9 +1014,15 @@ class EvidenceRecorder:
         high_metrics = self._decision_metrics(high_decisions)
         low_metrics = self._decision_metrics(low_decisions)
         failed_cases = self._representative_cases(
-            decisions, failed_ids, successful=False)
+            decisions, low_ids, successful=False)
         successful_cases = self._representative_cases(
             decisions, high_ids, successful=True)
+        explicit_feature_signal = self._explicit_feature_signal_metrics(
+            decisions, high_ids, low_ids)
+        time_quality_signal = self._time_quality_signal_metrics(
+            decisions, episodes)
+        llm_bias_guidance = self._llm_bias_guidance(
+            trend, explicit_feature_signal, time_quality_signal)
 
         considered = self._decision_metrics(decisions)['capability_decision_count']
         failure_modes = {
@@ -587,36 +1041,15 @@ class EvidenceRecorder:
             },
         }
 
-        if missed_count:
-            diagnosis_parts = [
-                'The current policy sometimes selects tasks with low '
-                'capability_match even when a higher-match valid alternative '
-                'is present.']
-            high_missed_rate = high_metrics.get('missed_better_alternative_rate')
-            low_missed_rate = low_metrics.get('missed_better_alternative_rate')
-            if (isinstance(high_missed_rate, (int, float))
-                    and isinstance(low_missed_rate, (int, float))
-                    and low_missed_rate > high_missed_rate):
-                diagnosis_parts.append(
-                    'This pattern is more frequent in failed or low-quality '
-                    'episodes than in high-quality episodes.')
-            if deadlock_tail_count:
-                diagnosis_parts.append(
-                    'Repeated poor-match choices also appear shortly before '
-                    'deadlock in this window.')
-            diagnosis_parts.append(
-                'A future decoder bias may need to increase the weight of '
-                'capability_match.')
-            diagnosis = ' '.join(diagnosis_parts)
-        elif low_count:
-            diagnosis = (
-                'The current policy makes some low capability_match choices, '
-                'but the recorded candidates do not consistently show a '
-                'higher-match valid alternative.')
-        else:
-            diagnosis = (
-                'This window does not provide evidence of a recurring '
-                'capability_match failure mode.')
+        diagnosis = self._diagnose_policy(
+            missed_count,
+            low_count,
+            deadlock_tail_count,
+            high_metrics,
+            low_metrics,
+            explicit_feature_signal,
+            time_quality_signal,
+            llm_bias_guidance)
 
         return {
             'window': {
@@ -655,16 +1088,20 @@ class EvidenceRecorder:
                 'high_quality_episode_ids': sorted(high_ids),
                 'low_quality_or_failed_episode_ids': sorted(low_ids),
             },
+            'explicit_feature_failure_signal': explicit_feature_signal,
+            'time_quality_signal': time_quality_signal,
+            'llm_bias_guidance': llm_bias_guidance,
             'representative_failed_decision_cases': failed_cases,
             'representative_successful_decision_cases': successful_cases,
             'current_policy_diagnosis': diagnosis,
             'recommended_llm_output_format': {
-                'weights': zero_feature_weights(),
-                'lambda': 0.0,
-                'clip_range': [-2.0, 2.0],
+                'weights': llm_bias_guidance['suggested_weights'],
+                'lambda': llm_bias_guidance['suggested_lambda'],
+                'clip_range': llm_bias_guidance['suggested_clip_range'],
                 'rationale': {
-                    'main_failure_modes': [],
-                    'expected_effect': [],
+                    'main_failure_modes': llm_bias_guidance[
+                        'main_failure_modes'],
+                    'expected_effect': llm_bias_guidance['expected_effect'],
                 },
             },
         }
@@ -861,15 +1298,142 @@ class EvidenceRecorder:
         for key, value in contrast['low_quality_or_failed_decisions'].items():
             lines.append('- {}: {}'.format(key, self._format_value(value)))
 
-        lines.extend(['', '## E. Representative failed decision cases', ''])
+        signal = report.get('explicit_feature_failure_signal') or {}
+        time_signal = report.get('time_quality_signal') or {}
+        guidance = report.get('llm_bias_guidance') or {}
+        lines.extend(['', '## E. Explicit feature failure and time-quality signals', ''])
+        if signal:
+            depot = signal.get('depot_choice', {})
+            depot_completion = signal.get(
+                'depot_with_completion_candidate', {})
+            missed_completion = signal.get('missed_completion_potential', {})
+            missed_reduction = signal.get(
+                'missed_requirement_reduction', {})
+            long_travel = signal.get('long_travel_choice', {})
+            missed_waiting = signal.get('missed_waiting_pressure', {})
+            lines.extend([
+                '- Decisions with valid task candidates: {} / {}'.format(
+                    signal.get('decisions_with_valid_task_candidates'),
+                    signal.get('decision_count')),
+                '- Depot choices: {} ({})'.format(
+                    depot.get('count'),
+                    self._format_value(depot.get('rate'), True)),
+                '- Depot despite completion-ready candidate: {} ({} of depot choices, {} of all decisions)'.format(
+                    depot_completion.get('count'),
+                    self._format_value(
+                        depot_completion.get('rate_among_depot_choices'), True),
+                    self._format_value(
+                        depot_completion.get('rate_among_all_decisions'), True)),
+                '- Missed completion-potential alternatives: {} ({})'.format(
+                    missed_completion.get('count'),
+                    self._format_value(missed_completion.get('rate'), True)),
+                '- Missed higher requirement-reduction alternatives: {} ({})'.format(
+                    missed_reduction.get('count'),
+                    self._format_value(missed_reduction.get('rate'), True)),
+                '- Unnecessarily long-travel choices: {} ({})'.format(
+                    long_travel.get('count'),
+                    self._format_value(long_travel.get('rate'), True)),
+                '- Missed higher waiting-pressure alternatives: {} ({})'.format(
+                    missed_waiting.get('count'),
+                    self._format_value(missed_waiting.get('rate'), True)),
+                '',
+                '**Chosen feature means**',
+                '',
+            ])
+            chosen_means = signal.get('chosen_feature_means', {})
+            for label, key in (
+                    ('All decisions', 'all_decisions'),
+                    ('High-quality decisions', 'high_quality_decisions'),
+                    ('Low-quality or failed decisions',
+                     'low_quality_or_failed_decisions')):
+                lines.append('- {}: `{}`'.format(
+                    label,
+                    json.dumps(chosen_means.get(key), ensure_ascii=False)))
+            lines.extend([
+                '- Best valid candidate means: `{}`'.format(
+                    json.dumps(
+                        signal.get('best_valid_feature_means', {}).get(
+                            'all_decisions'),
+                        ensure_ascii=False)),
+            ])
+            if time_signal:
+                fastest = time_signal.get('fastest_successful_metrics', {})
+                slowest = time_signal.get('slowest_successful_metrics', {})
+                gap = time_signal.get('slow_minus_fast', {})
+                lines.extend([
+                    '',
+                    '**Successful-episode time-quality signal**',
+                    '',
+                    '- Objective: {}'.format(time_signal.get('objective')),
+                    '- Successful episodes: {}'.format(
+                        time_signal.get('successful_episode_count')),
+                    '- All recorded episodes successful: {}'.format(
+                        'yes' if time_signal.get(
+                            'all_recorded_episodes_successful') else 'no'),
+                    '- Fastest successful episode IDs: `{}`'.format(
+                        json.dumps(
+                            time_signal.get('fastest_successful_episode_ids'),
+                            ensure_ascii=False)),
+                    '- Slowest successful episode IDs: `{}`'.format(
+                        json.dumps(
+                            time_signal.get('slowest_successful_episode_ids'),
+                            ensure_ascii=False)),
+                    '- Fastest average makespan / waiting: {} / {}'.format(
+                        self._format_value(fastest.get('average_makespan')),
+                        self._format_value(
+                            fastest.get('average_waiting_time'))),
+                    '- Slowest average makespan / waiting: {} / {}'.format(
+                        self._format_value(slowest.get('average_makespan')),
+                        self._format_value(
+                            slowest.get('average_waiting_time'))),
+                    '- Slow-minus-fast makespan / waiting: {} / {}'.format(
+                        self._format_value(gap.get('makespan')),
+                        self._format_value(gap.get('average_waiting_time'))),
+                    '- Slow-minus-fast chosen feature means: `{}`'.format(
+                        json.dumps(
+                            gap.get('chosen_feature_means'),
+                            ensure_ascii=False)),
+                    '- Time optimization needed: {}'.format(
+                        'yes' if time_signal.get(
+                            'time_optimization_needed') else 'no'),
+                    '- Feature weight directions: `{}`'.format(
+                        json.dumps(
+                            time_signal.get('feature_weight_directions'),
+                            ensure_ascii=False)),
+                ])
+            lines.extend([
+                '',
+                '**LLM bias guidance**',
+                '',
+                '- Should return nonzero bias: {}'.format(
+                    'yes' if guidance.get('should_return_nonzero_bias') else 'no'),
+                '- Suggested weights: `{}`'.format(
+                    json.dumps(
+                        guidance.get('suggested_weights'),
+                        ensure_ascii=False)),
+                '- Suggested lambda: {}'.format(
+                    self._format_value(guidance.get('suggested_lambda'))),
+                '- Main failure modes: `{}`'.format(
+                    json.dumps(
+                        guidance.get('main_failure_modes'),
+                        ensure_ascii=False)),
+                '- Expected effect: `{}`'.format(
+                    json.dumps(
+                        guidance.get('expected_effect'),
+                        ensure_ascii=False)),
+            ])
+        else:
+            lines.append('No explicit feature signal summary was available.')
+
+        lines.extend(['', '## F. Representative low-quality or failed decision cases', ''])
         failed_cases = report['representative_failed_decision_cases']
         if failed_cases:
             for case in failed_cases:
                 lines.extend(self._render_case(case, successful=False))
         else:
-            lines.append('No failed cases were available in this window.')
+            lines.append('No low-quality or failed cases were available in this window.')
 
-        lines.extend(['', '## F. Representative successful decision cases', ''])
+        lines.extend(['', '## G. Representative successful decision cases', ''])
         successful_cases = report['representative_successful_decision_cases']
         if successful_cases:
             for case in successful_cases:
@@ -879,11 +1443,11 @@ class EvidenceRecorder:
 
         lines.extend([
             '',
-            '## G. Current policy diagnosis',
+            '## H. Current policy diagnosis',
             '',
             report['current_policy_diagnosis'],
             '',
-            '## H. Recommended LLM output format',
+            '## I. Recommended LLM output format',
             '',
             '```json',
             json.dumps(

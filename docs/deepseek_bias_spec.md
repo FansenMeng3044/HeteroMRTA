@@ -80,21 +80,23 @@ configuration, prompts, responses, logs, exceptions, or checkpoints.
 
 ## Sanitized Bias
 
-Only this response schema is accepted:
+Only this response schema is accepted. The numeric values below are an
+illustrative nonzero config; all-zero weights with `lambda = 0` should be used
+only when the explicit feature failure signals show no actionable direction.
 
 ```json
 {
   "weights": {
-    "completion_potential": 0.0,
-    "requirement_reduction_ratio": 0.0,
-    "travel_time": 0.0,
-    "waiting_pressure": 0.0
+    "completion_potential": 0.8,
+    "requirement_reduction_ratio": 0.4,
+    "travel_time": -0.5,
+    "waiting_pressure": 0.3
   },
-  "lambda": 0.0,
+  "lambda": 0.25,
   "clip_range": [-2.0, 2.0],
   "rationale": {
-    "main_failure_modes": [],
-    "expected_effect": []
+    "main_failure_modes": ["completion-ready valid tasks were ignored"],
+    "expected_effect": ["increase logits for completion-ready task actions"]
   }
 }
 ```
@@ -146,7 +148,13 @@ Candidate records also include per-action `explicit_features`,
 `explicit_feature_logit_bias`, and `biased_model_logit`.
 Representative cases in each window JSON and Markdown report carry the same
 debug block so the report can be inspected without opening the decisions
-JSONL file.
+JSONL file. Each report also aggregates explicit feature failure signals and
+successful-episode time-quality signals, including depot choices while
+completion-ready tasks exist, missed completion/reduction/waiting-pressure
+alternatives, unnecessarily long travel choices, and fastest-vs-slowest
+successful episode makespan gaps. The prompt asks DeepSeek to return nonzero
+weights and lambda when those signals are present, even if success rate is
+already 1.0.
 
 Each training transition stores both its explicit feature matrix and the exact
 bias snapshot used during sampling. REINFORCE recomputation must use those
