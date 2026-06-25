@@ -37,11 +37,17 @@ def make_decision(chosen_match=0.0, alternative_match=1.0):
                 'is_valid': True,
                 'is_chosen': True,
                 'model_logit': 0.2,
-                'capability_logit_bias': 0.0,
+                'explicit_feature_logit_bias': 0.0,
                 'biased_model_logit': 0.2,
                 'model_prob': 0.6,
                 'remaining_requirement': [1, 0],
                 'original_requirement': [1, 0],
+                'explicit_features': {
+                    'completion_potential': 0.0,
+                    'requirement_reduction_ratio': chosen_match,
+                    'travel_time': 0.25,
+                    'waiting_pressure': 0.0,
+                },
                 'capability_match': chosen_match,
             },
             {
@@ -51,25 +57,47 @@ def make_decision(chosen_match=0.0, alternative_match=1.0):
                 'is_valid': True,
                 'is_chosen': False,
                 'model_logit': 0.1,
-                'capability_logit_bias': 0.05,
+                'explicit_feature_logit_bias': 0.05,
                 'biased_model_logit': 0.15,
                 'model_prob': 0.4,
                 'remaining_requirement': [0, 1],
                 'original_requirement': [0, 1],
+                'explicit_features': {
+                    'completion_potential': 1.0,
+                    'requirement_reduction_ratio': alternative_match,
+                    'travel_time': 0.1,
+                    'waiting_pressure': 0.5,
+                },
                 'capability_match': alternative_match,
             },
         ],
         'decoder_logit_debug': {
             'bias_global_step': 3000,
             'bias_apply': True,
-            'used_weight': 0.5,
+            'used_weights': {
+                'completion_potential': 0.5,
+                'requirement_reduction_ratio': 0.0,
+                'travel_time': -0.5,
+                'waiting_pressure': 0.1,
+            },
             'used_lambda': 0.1,
             'clip_range': [-2.0, 2.0],
+            'feature_names': [
+                'completion_potential',
+                'requirement_reduction_ratio',
+                'travel_time',
+                'waiting_pressure',
+            ],
             'action_index_order': '0=depot, action_i=task_id_i_minus_1',
             'valid_action_mask': [True, True, True],
             'capability_match': [0.0, chosen_match, alternative_match],
+            'explicit_features': [
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, chosen_match, 0.25, 0.0],
+                [1.0, alternative_match, 0.1, 0.5],
+            ],
             'raw_decoder_logits': [0.0, 0.2, 0.1],
-            'capability_logit_bias': [0.0, 0.0, 0.05],
+            'explicit_feature_logit_bias': [0.0, 0.0, 0.05],
             'biased_decoder_logits': [0.0, 0.2, 0.15],
         },
     }
@@ -131,21 +159,21 @@ class EpisodeEvidenceBufferTest(unittest.TestCase):
 
 
 class EvidenceRecorderTest(unittest.TestCase):
-    def test_default_interval_uses_3000_step_window_names(self):
+    def test_default_interval_uses_10000_step_window_names(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = EvidenceRecorder(output_dir=temp_dir)
-            self.assertEqual(3000, recorder.interval_steps)
+            self.assertEqual(10000, recorder.interval_steps)
             recorder.record_episode_payload({
                 'episode': make_episode(),
-                'decisions': [make_decision() for _ in range(3000)],
+                'decisions': [make_decision() for _ in range(10000)],
             })
             self.assertTrue((
                 Path(temp_dir)
-                / 'evidence_window_00000000_00003000.md'
+                / 'evidence_window_00000000_00010000.md'
             ).exists())
             self.assertEqual(
                 Path(temp_dir)
-                / 'evidence_window_00000000_00003000.md',
+                / 'evidence_window_00000000_00010000.md',
                 recorder.latest_markdown_report_path)
 
     def test_complete_window_writes_all_artifacts_and_sections(self):
@@ -175,7 +203,12 @@ class EvidenceRecorderTest(unittest.TestCase):
                 report['failure_mode_distribution'][
                     'missed_better_capability_alternative']['count'])
             self.assertEqual(
-                {'capability_match': 0.0},
+                {
+                    'completion_potential': 0.0,
+                    'requirement_reduction_ratio': 0.0,
+                    'travel_time': 0.0,
+                    'waiting_pressure': 0.0,
+                },
                 report['recommended_llm_output_format']['weights'])
             failed_case = report['representative_failed_decision_cases'][0]
             self.assertIn('decoder_logit_debug', failed_case)
@@ -184,7 +217,10 @@ class EvidenceRecorderTest(unittest.TestCase):
                 failed_case['decoder_logit_debug']['raw_decoder_logits'])
             self.assertEqual(
                 0.05,
-                failed_case['candidates'][1]['capability_logit_bias'])
+                failed_case['candidates'][1]['explicit_feature_logit_bias'])
+            self.assertIn(
+                'completion_potential',
+                failed_case['candidates'][1]['explicit_features'])
 
             markdown = (
                 Path(temp_dir) / 'evidence_window_00000000_00000002.md'
@@ -192,7 +228,7 @@ class EvidenceRecorderTest(unittest.TestCase):
             for section in 'ABCDEFGH':
                 self.assertIn('## {}.'.format(section), markdown)
             self.assertIn('Raw decoder logits', markdown)
-            self.assertIn('Capability logit bias', markdown)
+            self.assertIn('Explicit feature logit bias', markdown)
             self.assertIn('Biased decoder logits', markdown)
 
     def test_partial_window_flush_and_previous_window_change(self):

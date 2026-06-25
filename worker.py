@@ -18,6 +18,7 @@ from utils.evidence_recorder import (
 )
 from utils.bias_manager import (
     bias_snapshot_to_tensor,
+    EXPLICIT_BIAS_FEATURES,
     normalize_bias_snapshot,
 )
 
@@ -88,12 +89,12 @@ class Worker:
                     if training:
                         task_info, total_agents, mask = self.obs_padding(task_info, total_agents, mask)
                     index = torch.LongTensor([agent_id]).reshape(1, 1, 1).to(self.device)
-                    capability_match, bias_params = self._get_bias_tensors(
+                    explicit_features, bias_params = self._get_bias_tensors(
                         agent_id, task_info.shape[1])
                     bias_kwargs = {}
                     if self.bias_config['apply_bias']:
                         bias_kwargs = {
-                            'capability_match': capability_match,
+                            'explicit_features': explicit_features,
                             'bias_params': bias_params,
                         }
                     if collect_evidence:
@@ -128,7 +129,7 @@ class Worker:
                                 mask,
                                 logit_bias,
                                 biased_logits,
-                                capability_match)
+                                explicit_features)
                         except Exception:
                             # Evidence is best-effort and must never stop training.
                             decision_record = None
@@ -143,7 +144,7 @@ class Worker:
                         buffer_dict[4] += torch.FloatTensor([[0]]).to(self.device)  # reward
                         buffer_dict[5] += index
                         buffer_dict[6] += torch.FloatTensor([[0]]).to(self.device)
-                        buffer_dict[7] += capability_match
+                        buffer_dict[7] += explicit_features
                         buffer_dict[8] += bias_params
                         current_action_index += 1
                         if collect_evidence and decision_record is not None:
@@ -176,24 +177,21 @@ class Worker:
         return terminal_reward, buffer_dict, perf_metrics
 
     def _get_bias_tensors(self, agent_id, action_count):
-        if self.bias_config['apply_bias']:
-            capability_values = self.env.get_capability_match_action_vector(
-                agent_id, action_count=action_count)
-        else:
-            capability_values = np.zeros(action_count, dtype=float)
-        capability_match = torch.tensor(
-            capability_values,
+        feature_values = self.env.get_explicit_bias_feature_matrix(
+            agent_id, action_count=action_count)
+        explicit_features = torch.tensor(
+            feature_values,
             dtype=torch.float,
             device=self.device).unsqueeze(0)
         bias_params = bias_snapshot_to_tensor(
             self.bias_config,
             device=self.device,
             dtype=torch.float)
-        return capability_match, bias_params
+        return explicit_features, bias_params
 
     def _build_decision_evidence(self, agent_id, chosen_action, probs, logits,
                                  mask, logit_bias=None,
-                                 biased_logits=None, capability_match=None):
+                                 biased_logits=None, explicit_features=None):
         """Capture a lightweight decision snapshot before the environment mutates."""
         agent = self.env.agent_dic[agent_id]
         action_count = self.env.tasks_num + 1
@@ -215,7 +213,16 @@ class Worker:
             logit_bias=(
                 logit_bias[0] if logit_bias is not None else None),
             biased_logits=(
-                biased_logits[0] if biased_logits is not None else None))
+                biased_logits[0] if biased_logits is not None else None),
+            explicit_features=(
+                explicit_features[0]
+                if explicit_features is not None else None),
+            feature_names=EXPLICIT_BIAS_FEATURES)
+        capability_match = self.env.get_capability_match_action_vector(
+            agent_id, action_count=action_count)
+        explicit_feature_values = to_python(
+            explicit_features[0, :action_count]
+            if explicit_features is not None else None)
         return {
             'train_step': None,
             'current_agent_id': agent_id,
@@ -240,18 +247,18 @@ class Worker:
             'decoder_logit_debug': {
                 'bias_global_step': self.bias_config['global_step'],
                 'bias_apply': self.bias_config['apply_bias'],
-                'used_weight': self.bias_config['used_weight'],
+                'used_weights': self.bias_config['used_weights'],
                 'used_lambda': self.bias_config['used_lambda'],
                 'clip_range': self.bias_config['clip_range'],
+                'feature_names': self.bias_config['feature_names'],
                 'action_index_order': '0=depot, action_i=task_id_i_minus_1',
                 'valid_action_mask': to_python(
                     (~mask[0, :action_count].bool())),
-                'capability_match': to_python(
-                    capability_match[0, :action_count]
-                    if capability_match is not None else None),
+                'capability_match': to_python(capability_match),
+                'explicit_features': explicit_feature_values,
                 'raw_decoder_logits': to_python(
                     logits[0, :action_count]),
-                'capability_logit_bias': to_python(
+                'explicit_feature_logit_bias': to_python(
                     logit_bias[0, :action_count]
                     if logit_bias is not None else None),
                 'biased_decoder_logits': to_python(
@@ -318,12 +325,12 @@ class Worker:
                         continue
                     task_info, total_agents, mask = self.obs_padding(task_info, total_agents, mask)
                     index = torch.LongTensor([agent_id]).reshape(1, 1, 1).to(self.device)
-                    capability_match, bias_params = self._get_bias_tensors(
+                    explicit_features, bias_params = self._get_bias_tensors(
                         agent_id, task_info.shape[1])
                     bias_kwargs = {}
                     if self.bias_config['apply_bias']:
                         bias_kwargs = {
-                            'capability_match': capability_match,
+                            'explicit_features': explicit_features,
                             'bias_params': bias_params,
                         }
                     probs, _ = self.local_baseline(

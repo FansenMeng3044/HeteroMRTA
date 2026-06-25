@@ -11,31 +11,43 @@ from attention import AttentionNet
 from parameters import DeepSeekBiasParams, EvidenceParams
 from utils.bias_manager import (
     BiasManager,
+    EXPLICIT_BIAS_FEATURES,
     bias_snapshot_to_tensor,
-    compute_capability_match_bias,
+    compute_explicit_feature_bias,
     normalize_bias_snapshot,
+    zero_feature_weights,
 )
 from utils.deepseek_bias_controller import DeepSeekBiasController
 from utils.deepseek_client import DeepSeekClient, DeepSeekResponseTruncated
 
 
 VALID_RAW_CONFIG = {
-    'weights': {'capability_match': 0.8},
+    'weights': {
+        'completion_potential': 0.8,
+        'requirement_reduction_ratio': 0.4,
+        'travel_time': -0.6,
+        'waiting_pressure': 0.2,
+    },
     'lambda': 0.12,
     'clip_range': [-2.0, 2.0],
     'rationale': {
-        'main_failure_modes': ['low capability match'],
-        'expected_effect': ['prefer contributable tasks'],
+        'main_failure_modes': ['long travel before closing coalitions'],
+        'expected_effect': ['prefer close tasks that can be completed'],
     },
 }
 
 
 class CapabilityBiasMathTest(unittest.TestCase):
     def test_formula_clipping_depot_and_invalid_actions(self):
-        capability = torch.tensor([[0.0, 1.0, 1.0, 0.0]])
+        features = torch.tensor([[
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.5, 0.2, 0.0],
+            [1.0, 1.0, 0.1, 0.0],
+            [0.0, 0.0, 0.5, 1.0],
+        ]])
         valid = torch.tensor([[True, True, False, True]])
-        params = torch.tensor([[1.0, 2.0, 0.5, -0.4, 0.4]])
-        bias = compute_capability_match_bias(capability, valid, params)
+        params = torch.tensor([[1.0, 0.5, -0.4, 0.4, 2.0, 1.0, -1.0, 0.5]])
+        bias = compute_explicit_feature_bias(features, valid, params)
         torch.testing.assert_close(
             bias, torch.tensor([[0.0, 0.4, 0.0, 0.0]]))
 
@@ -50,23 +62,32 @@ class CapabilityBiasMathTest(unittest.TestCase):
 
         disabled = bias_snapshot_to_tensor({
             'apply_bias': False,
-            'used_weight': 1.0,
+            'used_weights': {
+                'completion_potential': 1.0,
+            },
             'used_lambda': 1.0,
         })
-        capability = torch.tensor([[0.0, 1.0, 1.0, 0.0]])
+        explicit_features = torch.tensor([[
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.5, 0.2, 0.0],
+            [1.0, 1.0, 0.1, 0.0],
+            [0.0, 0.0, 0.5, 1.0],
+        ]])
         disabled_probs, disabled_logps = network(
             tasks,
             agents,
             mask,
             index,
-            capability_match=capability,
+            explicit_features=explicit_features,
             bias_params=disabled)
         self.assertTrue(torch.equal(original_probs, disabled_probs))
         self.assertTrue(torch.equal(original_logps, disabled_logps))
 
         active = bias_snapshot_to_tensor({
             'apply_bias': True,
-            'used_weight': 1.0,
+            'used_weights': {
+                'completion_potential': 1.0,
+            },
             'used_lambda': 1.0,
             'clip_range': [-2.0, 2.0],
         })
@@ -75,7 +96,7 @@ class CapabilityBiasMathTest(unittest.TestCase):
             agents,
             mask,
             index,
-            capability_match=capability,
+            explicit_features=explicit_features,
             bias_params=active)
         self.assertEqual(0.0, active_probs[0, 2].item())
         self.assertGreater(active_probs[0, 1].item(), original_probs[0, 1].item())
@@ -84,10 +105,10 @@ class CapabilityBiasMathTest(unittest.TestCase):
 class BiasManagerTest(unittest.TestCase):
     def test_requested_defaults_are_exposed(self):
         self.assertTrue(EvidenceParams.ENABLE_EVIDENCE_LOGGING)
-        self.assertEqual(3000, EvidenceParams.EVIDENCE_LOG_INTERVAL_STEPS)
+        self.assertEqual(10000, EvidenceParams.EVIDENCE_LOG_INTERVAL_STEPS)
         self.assertEqual('./evidence_logs', EvidenceParams.EVIDENCE_OUTPUT_DIR)
-        self.assertEqual(20, EvidenceParams.MAX_CASES_PER_REPORT)
-        self.assertEqual(8, EvidenceParams.MAX_CANDIDATES_PER_DECISION)
+        self.assertEqual(5, EvidenceParams.MAX_CASES_PER_REPORT)
+        self.assertEqual(5, EvidenceParams.MAX_CANDIDATES_PER_DECISION)
         self.assertTrue(DeepSeekBiasParams.ENABLE_DEEPSEEK_BIAS)
         self.assertEqual(
             30000, DeepSeekBiasParams.DEEPSEEK_BIAS_UPDATE_INTERVAL_STEPS)
@@ -118,10 +139,20 @@ class BiasManagerTest(unittest.TestCase):
                 VALID_RAW_CONFIG,
                 global_step=3000,
                 source_report='evidence_window_00000000_00003000.md')
-            self.assertAlmostEqual(0.24, snapshot['used_weight'])
+            self.assertEqual(list(EXPLICIT_BIAS_FEATURES), snapshot['feature_names'])
+            self.assertAlmostEqual(
+                0.24, snapshot['used_weights']['completion_potential'])
+            self.assertAlmostEqual(
+                0.12, snapshot['used_weights']['requirement_reduction_ratio'])
+            self.assertAlmostEqual(
+                -0.18, snapshot['used_weights']['travel_time'])
+            self.assertAlmostEqual(
+                0.06, snapshot['used_weights']['waiting_pressure'])
             self.assertAlmostEqual(0.036, snapshot['used_lambda'])
             self.assertTrue(snapshot['apply_bias'])
-            self.assertEqual(0.8, snapshot['raw_deepseek_weight'])
+            self.assertEqual(
+                0.8,
+                snapshot['raw_deepseek_weights']['completion_potential'])
             self.assertEqual(0.12, snapshot['raw_deepseek_lambda'])
             self.assertTrue(
                 (bias_dir / 'active_bias_config_00003000.json').exists())
@@ -131,8 +162,7 @@ class BiasManagerTest(unittest.TestCase):
                 response_output_dir=response_dir,
                 ema_alpha=0.3)
             self.assertEqual(snapshot, restored.get_snapshot())
-            self.assertEqual(
-                {'capability_match': 0.8}, sanitized['weights'])
+            self.assertEqual(VALID_RAW_CONFIG['weights'], sanitized['weights'])
 
     def test_sanitize_rejects_other_features_and_clamps_safe_ranges(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -140,18 +170,24 @@ class BiasManagerTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 manager.sanitize({
                     'weights': {
-                        'capability_match': 1.0,
+                        'completion_potential': 1.0,
                         'sync_delay': 1.0,
                     },
                     'lambda': 1.0,
                     'clip_range': [-2.0, 2.0],
                 })
             sanitized = manager.sanitize({
-                'weights': {'capability_match': 99.0},
+                'weights': {
+                    'completion_potential': 99.0,
+                    'requirement_reduction_ratio': 0.5,
+                    'travel_time': -99.0,
+                    'waiting_pressure': 0.0,
+                },
                 'lambda': 99.0,
                 'clip_range': [-99.0, 99.0],
             })
-            self.assertEqual(2.0, sanitized['weights']['capability_match'])
+            self.assertEqual(2.0, sanitized['weights']['completion_potential'])
+            self.assertEqual(-2.0, sanitized['weights']['travel_time'])
             self.assertEqual(1.0, sanitized['lambda'])
             self.assertEqual([-10.0, 10.0], sanitized['clip_range'])
 
@@ -161,7 +197,7 @@ class BiasManagerTest(unittest.TestCase):
             manager = BiasManager(enabled=False, output_dir=output)
             snapshot = manager.get_snapshot()
             self.assertFalse(snapshot['apply_bias'])
-            self.assertEqual(0.0, snapshot['used_weight'])
+            self.assertEqual(zero_feature_weights(), snapshot['used_weights'])
             self.assertFalse(output.exists())
 
     def test_failed_active_config_write_keeps_previous_snapshot(self):
@@ -180,13 +216,16 @@ class BiasManagerTest(unittest.TestCase):
     def test_malformed_restored_snapshot_falls_back_to_zero_bias(self):
         malformed = normalize_bias_snapshot({
             'apply_bias': True,
-            'used_weight': float('nan'),
+            'used_weights': {
+                'completion_potential': float('nan'),
+                'requirement_reduction_ratio': 'bad',
+            },
             'used_lambda': 'bad',
             'clip_range': [5.0],
             'global_step': 'bad',
         })
         self.assertFalse(malformed['apply_bias'])
-        self.assertEqual(0.0, malformed['used_weight'])
+        self.assertEqual(zero_feature_weights(), malformed['used_weights'])
         self.assertEqual(0.0, malformed['used_lambda'])
         self.assertEqual([-2.0, 2.0], malformed['clip_range'])
         self.assertEqual(0, malformed['global_step'])
@@ -296,8 +335,8 @@ class DeepSeekBiasControllerTest(unittest.TestCase):
                 'deepseek-v4-flash',
                 transport=transport)
             reports = [
-                self._report(root, start, start + 3000)
-                for start in range(0, 30000, 3000)
+                self._report(root, start, start + 10000)
+                for start in range(0, 30000, 10000)
             ]
             with mock.patch.dict(
                     os.environ, {'DEEPSEEK_API_KEY': 'secret'}):
@@ -317,9 +356,9 @@ class DeepSeekBiasControllerTest(unittest.TestCase):
             prompt = calls[0]['messages'][0]['content']
             self.assertIn('DeepSeek bias update window: (0, 30000]', prompt)
             self.assertIn(
-                'evidence_window_00000000_00003000.md', prompt)
+                'evidence_window_00000000_00010000.md', prompt)
             self.assertIn(
-                'evidence_window_00027000_00030000.md', prompt)
+                'evidence_window_00020000_00030000.md', prompt)
             attempt = json.loads((
                 responses / 'deepseek_attempt_00000000_00030000.json'
             ).read_text(encoding='utf-8'))
@@ -445,7 +484,7 @@ class DeepSeekBiasControllerTest(unittest.TestCase):
 
             self.assertFalse(updated)
             self.assertFalse(snapshot['apply_bias'])
-            self.assertEqual(0.0, snapshot['used_weight'])
+            self.assertEqual(zero_feature_weights(), snapshot['used_weights'])
             self.assertEqual(1, len(calls))
 
     def test_truncated_response_writes_visible_warning_and_fallback(self):

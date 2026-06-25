@@ -1,16 +1,16 @@
-# DeepSeek Window-Level Capability Bias Specification
+# DeepSeek Window-Level Explicit Feature Bias Specification
 
 ## Required Sequence
 
-The training process uses 3000 effective transitions per evidence window and 30000 effective transitions per DeepSeek update window:
+The training process uses 10000 effective transitions per evidence window and 30000 effective transitions per DeepSeek update window:
 
 ```text
-train for one 3000-transition evidence window
+train for one 10000-transition evidence window
 generate the evidence report
 repeat until 30000 accepted transitions have accumulated since the last DeepSeek attempt
 call DeepSeek once from the main process with all reports in that update window
 parse and sanitize the JSON response
-update the cached capability_match bias with EMA
+update the cached explicit feature bias with EMA
 discard any late Ray result produced by an older snapshot
 use the new immutable snapshot for all accepted rollout work
 repeat at the next 30000-transition update boundary
@@ -32,10 +32,10 @@ The Python configuration must provide defaults equivalent to:
 
 ```yaml
 enable_evidence_logging: true
-evidence_log_interval_steps: 3000
+evidence_log_interval_steps: 10000
 evidence_output_dir: "./evidence_logs"
-max_cases_per_report: 20
-max_candidates_per_decision: 8
+max_cases_per_report: 5
+max_candidates_per_decision: 5
 
 enable_deepseek_bias: true
 deepseek_bias_update_interval_steps: 30000
@@ -84,7 +84,12 @@ Only this response schema is accepted:
 
 ```json
 {
-  "weights": {"capability_match": 0.0},
+  "weights": {
+    "completion_potential": 0.0,
+    "requirement_reduction_ratio": 0.0,
+    "travel_time": 0.0,
+    "waiting_pressure": 0.0
+  },
   "lambda": 0.0,
   "clip_range": [-2.0, 2.0],
   "rationale": {
@@ -94,15 +99,17 @@ Only this response schema is accepted:
 }
 ```
 
-The sanitized weight is clamped to `[-2, 2]`, lambda to `[0, 1]`, and clip
-bounds to `[-10, 10]` with `low < high`. EMA is applied independently:
+Only these four weight keys are allowed. Each sanitized weight is clamped to
+`[-2, 2]`, lambda to `[0, 1]`, and clip bounds to `[-10, 10]` with
+`low < high`. EMA is applied independently per weight:
 
 ```text
 used = alpha * sanitized_raw + (1 - alpha) * previous_used
 ```
 
-The initial previous values are zero. Therefore an initial raw weight of
-`0.8` produces a used weight of `0.24` when alpha is `0.3`.
+The initial previous values are zero. Therefore an initial raw
+`completion_potential` weight of `0.8` produces a used weight of `0.24` when
+alpha is `0.3`.
 
 The active file records global step, source report, apply flag, used and raw
 values, EMA alpha, clip range, and update interval.
@@ -110,13 +117,21 @@ values, EMA alpha, clip range, and update interval.
 ## Decoder And Training Consistency
 
 Workers receive only a JSON-safe immutable snapshot. For each decision they
-compute the action-space capability vector by reusing
-`TaskEnv.get_capability_match`; depot and padded actions are zero.
+compute an action-space explicit feature matrix. Depot and padded actions are
+zero. Task actions use:
 
-The only explicit feature is `capability_match`. The bias is:
+- `completion_potential`: whether the current agent can immediately close the
+  task's remaining requirement.
+- `requirement_reduction_ratio`: the fraction of remaining requirement this
+  agent can reduce.
+- `travel_time`: normalized current-agent travel time to the task.
+- `waiting_pressure`: normalized waiting time pressure from agents already at
+  the task.
+
+The bias is:
 
 ```text
-clip(lambda * weight * capability_match, clip_range)
+clip(lambda * dot(feature_vector, weights), clip_range)
 ```
 
 Invalid actions receive zero bias and retain the original mask. Bias is added
@@ -125,16 +140,17 @@ to pointer logits before masking and softmax.
 Evidence records the raw decoder score before this bias is added, while action
 probabilities come from the final biased and masked logits.
 Each decision JSONL record includes `decoder_logit_debug`, which stores
-`raw_decoder_logits`, `capability_logit_bias`, and `biased_decoder_logits`
-for the action vector before invalid-action masking. Candidate records also
-include per-action `capability_logit_bias` and `biased_model_logit`.
+`raw_decoder_logits`, `explicit_feature_logit_bias`, and
+`biased_decoder_logits` for the action vector before invalid-action masking.
+Candidate records also include per-action `explicit_features`,
+`explicit_feature_logit_bias`, and `biased_model_logit`.
 Representative cases in each window JSON and Markdown report carry the same
 debug block so the report can be inspected without opening the decisions
 JSONL file.
 
-Each training transition stores both its capability vector and the exact bias
-snapshot used during sampling. REINFORCE recomputation must use those stored
-values, even after the active snapshot changes.
+Each training transition stores both its explicit feature matrix and the exact
+bias snapshot used during sampling. REINFORCE recomputation must use those
+stored values, even after the active snapshot changes.
 
 When DeepSeek bias is disabled or the active snapshot is disabled, the model
 must follow the original no-bias code path without changing logits, masks,
@@ -144,10 +160,10 @@ sampling order, rewards, buffers, or trajectories.
 
 ```text
 evidence_logs/
-  evidence_window_00000000_00003000.md
-  evidence_window_00003000_00006000.md
+  evidence_window_00000000_00010000.md
+  evidence_window_00010000_00020000.md
   ...
-  evidence_window_00027000_00030000.md
+  evidence_window_00020000_00030000.md
   deepseek_responses/
     deepseek_prompt_00000000_00030000.txt
     deepseek_raw_00000000_00030000.json
@@ -160,7 +176,7 @@ evidence_logs/
 
 A forced shutdown flush may write a partial report. On restart, its JSONL
 records are reloaded and the same fixed window is continued to the next
-3000-step boundary; partial flushes do not shift later window numbering.
+10000-step boundary; partial flushes do not shift later window numbering.
 
 ## Acceptance Evidence
 
@@ -168,4 +184,4 @@ Tests must cover one call per update interval, skipped report-only windows, aggr
 behavior, EMA, sanitization, malformed output, timeout fallback, environment
 key handling, response files, snapshot restore, worker synchronization,
 rollout/training probability consistency, unchanged masks, disabled trajectory
-equivalence, 3000-step evidence naming, 30000-step DeepSeek update naming, and absence of network code in forward methods.
+equivalence, 10000-step evidence naming, 30000-step DeepSeek update naming, and absence of network code in forward methods.

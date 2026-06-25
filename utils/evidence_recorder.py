@@ -3,6 +3,7 @@ import json
 import math
 import re
 from pathlib import Path
+from utils.bias_manager import EXPLICIT_BIAS_FEATURES, zero_feature_weights
 
 
 def to_python(value):
@@ -80,7 +81,9 @@ def select_candidate_action_indices(probabilities, valid_actions, capability_mat
 
 def build_candidate_records(env, agent_id, chosen_action, probabilities, logits, mask,
                             max_candidates, top_k=5, low_threshold=0.3,
-                            logit_bias=None, biased_logits=None):
+                            logit_bias=None, biased_logits=None,
+                            explicit_features=None,
+                            feature_names=EXPLICIT_BIAS_FEATURES):
     """Build bounded candidate records from the current decoder output and state."""
     action_count = env.tasks_num + 1
     probability_values = to_python(probabilities)[:action_count]
@@ -97,6 +100,22 @@ def build_candidate_records(env, agent_id, chosen_action, probabilities, logits,
     capability_matches.extend(
         env.get_capability_match(agent_id, task_id)
         for task_id in range(env.tasks_num))
+    feature_names = list(feature_names)
+    feature_values = (
+        to_python(explicit_features)[:action_count]
+        if explicit_features is not None else None)
+
+    def action_feature_dict(action_index):
+        if feature_values is None or action_index >= len(feature_values):
+            return {}
+        row = feature_values[action_index]
+        if row is None:
+            return {}
+        return {
+            feature: row[index]
+            for index, feature in enumerate(feature_names)
+            if index < len(row)
+        }
 
     selected = select_candidate_action_indices(
         probability_values,
@@ -117,11 +136,13 @@ def build_candidate_records(env, agent_id, chosen_action, probabilities, logits,
                 'is_valid': valid_actions[action_index],
                 'is_chosen': action_index == chosen_action,
                 'model_logit': logit_values[action_index],
+                'explicit_feature_logit_bias': logit_bias_values[action_index],
                 'capability_logit_bias': logit_bias_values[action_index],
                 'biased_model_logit': biased_logit_values[action_index],
                 'model_prob': probability_values[action_index],
                 'remaining_requirement': None,
                 'original_requirement': None,
+                'explicit_features': action_feature_dict(action_index),
                 # Depot is not a robot-task pair, so capability_match is null.
                 'capability_match': None,
             })
@@ -135,11 +156,13 @@ def build_candidate_records(env, agent_id, chosen_action, probabilities, logits,
             'is_valid': valid_actions[action_index],
             'is_chosen': action_index == chosen_action,
             'model_logit': logit_values[action_index],
+            'explicit_feature_logit_bias': logit_bias_values[action_index],
             'capability_logit_bias': logit_bias_values[action_index],
             'biased_model_logit': biased_logit_values[action_index],
             'model_prob': probability_values[action_index],
             'remaining_requirement': to_python(task['status']),
             'original_requirement': to_python(task['requirements']),
+            'explicit_features': action_feature_dict(action_index),
             'capability_match': capability_matches[action_index],
         })
     return candidates
@@ -180,8 +203,8 @@ class EpisodeEvidenceBuffer:
 class EvidenceRecorder:
     """Main-process writer and window aggregator."""
 
-    def __init__(self, enabled=True, interval_steps=3000,
-                 output_dir='./evidence_logs', max_cases_per_report=20,
+    def __init__(self, enabled=True, interval_steps=10000,
+                 output_dir='./evidence_logs', max_cases_per_report=5,
                  low_threshold=0.3, better_alternative_gap=0.3,
                  deadlock_lookback=10):
         self.enabled = bool(enabled)
@@ -612,6 +635,20 @@ class EvidenceRecorder:
                     'TaskEnv.compute_capability_match_from_existing_logic, '
                     'which is also used by the original contributable-task mask.'),
             },
+            'explicit_bias_feature_definitions': {
+                'completion_potential': (
+                    '1 when the current agent can close the remaining task '
+                    'requirement and make the coalition executable.'),
+                'requirement_reduction_ratio': (
+                    'Fraction of the task remaining requirement reduced by '
+                    'the current agent, clipped to [0, 1].'),
+                'travel_time': (
+                    'Current-agent travel time to the task normalized by the '
+                    'maximum direct map travel time; larger is farther.'),
+                'waiting_pressure': (
+                    'Normalized maximum waiting time among agents already '
+                    'queued at the task coalition.'),
+            },
             'aggregate_contrast': {
                 'high_quality_decisions': high_metrics,
                 'low_quality_or_failed_decisions': low_metrics,
@@ -622,7 +659,7 @@ class EvidenceRecorder:
             'representative_successful_decision_cases': successful_cases,
             'current_policy_diagnosis': diagnosis,
             'recommended_llm_output_format': {
-                'weights': {'capability_match': 0.0},
+                'weights': zero_feature_weights(),
                 'lambda': 0.0,
                 'clip_range': [-2.0, 2.0],
                 'rationale': {
@@ -675,8 +712,8 @@ class EvidenceRecorder:
             '',
             '**Candidate comparison**',
             '',
-            '| Task | Probability | Raw logit | Feature bias | Biased logit | Chosen | Valid | State | Capability match | Remaining requirement |',
-            '|---|---:|---:|---:|---:|:---:|:---:|---|---:|---|',
+            '| Task | Probability | Raw logit | Feature bias | Biased logit | Chosen | Valid | State | Capability match | Explicit features | Remaining requirement |',
+            '|---|---:|---:|---:|---:|:---:|:---:|---|---:|---|---|',
         ]
         for candidate in case.get('candidates', []):
             task_label = (
@@ -687,33 +724,42 @@ class EvidenceRecorder:
                     task_label,
                     self._format_value(candidate.get('model_prob')),
                     self._format_value(candidate.get('model_logit')),
-                    self._format_value(candidate.get('capability_logit_bias')),
+                    self._format_value(
+                        candidate.get('explicit_feature_logit_bias')),
                     self._format_value(candidate.get('biased_model_logit')),
                     'yes' if candidate.get('is_chosen') else 'no',
                     'yes' if candidate.get('is_valid') else 'no',
                     candidate.get('task_state'),
                     self._format_value(candidate.get('capability_match')),
+                    json.dumps(
+                        candidate.get('explicit_features', {}),
+                        ensure_ascii=False),
                     json.dumps(candidate.get('remaining_requirement'))))
         if debug:
             lines.extend([
                 '',
                 '**Decoder logit debug**',
                 '',
-                '- Bias config: step={}, apply={}, weight={}, lambda={}, clip_range=`{}`'.format(
+                '- Bias config: step={}, apply={}, weights=`{}`, lambda={}, clip_range=`{}`'.format(
                     debug.get('bias_global_step'),
                     debug.get('bias_apply'),
-                    self._format_value(debug.get('used_weight')),
+                    json.dumps(debug.get('used_weights'), ensure_ascii=False),
                     self._format_value(debug.get('used_lambda')),
                     json.dumps(debug.get('clip_range'))),
                 '- Action order: {}'.format(debug.get('action_index_order')),
+                '- Feature names: `{}`'.format(
+                    self._format_vector(debug.get('feature_names'))),
                 '- Valid action mask: `{}`'.format(
                     self._format_vector(debug.get('valid_action_mask'))),
                 '- Capability match: `{}`'.format(
                     self._format_vector(debug.get('capability_match'))),
+                '- Explicit features: `{}`'.format(
+                    self._format_vector(debug.get('explicit_features'))),
                 '- Raw decoder logits: `{}`'.format(
                     self._format_vector(debug.get('raw_decoder_logits'))),
-                '- Capability logit bias: `{}`'.format(
-                    self._format_vector(debug.get('capability_logit_bias'))),
+                '- Explicit feature logit bias: `{}`'.format(
+                    self._format_vector(
+                        debug.get('explicit_feature_logit_bias'))),
                 '- Biased decoder logits: `{}`'.format(
                     self._format_vector(debug.get('biased_decoder_logits'))),
             ])
@@ -797,6 +843,12 @@ class EvidenceRecorder:
             'The current implementation is binary because the original project '
             'logic only checks whether the agent can reduce the remaining '
             'requirement.',
+            '',
+            'The LLM-controlled decoder bias uses four explicit action-level '
+            'features: `completion_potential`, `requirement_reduction_ratio`, '
+            '`travel_time`, and `waiting_pressure`. These are deterministic '
+            'environment features computed for each candidate action before '
+            'masking; depot and padding actions use zero feature values.',
             '',
             '## D. Aggregate contrast',
             '',

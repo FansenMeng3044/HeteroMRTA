@@ -6,6 +6,7 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 from itertools import combinations, product
 import copy
+from utils.bias_manager import EXPLICIT_BIAS_FEATURES
 
 
 class TaskEnv:
@@ -352,6 +353,68 @@ class TaskEnv:
             values = values[:action_count]
             values.extend([0.0] * max(0, action_count - len(values)))
         return np.asarray(values, dtype=float)
+
+    def get_explicit_bias_feature_matrix(self, agent_id, action_count=None):
+        """Return [depot, task features, padding] for explicit decoder bias."""
+        rows = [np.zeros(len(EXPLICIT_BIAS_FEATURES), dtype=float)]
+        rows.extend(
+            self.get_task_explicit_bias_features(agent_id, task_id)
+            for task_id in range(self.tasks_num))
+        if action_count is not None:
+            rows = rows[:action_count]
+            rows.extend(
+                np.zeros(len(EXPLICIT_BIAS_FEATURES), dtype=float)
+                for _ in range(max(0, action_count - len(rows))))
+        return np.asarray(rows, dtype=float)
+
+    def get_task_explicit_bias_features(self, agent_id, task_id):
+        """Compute normalized action-level features for one agent-task pair."""
+        agent = self.agent_dic[agent_id]
+        task = self.task_dic[task_id]
+        if (task.get('feasible_assignment') or task.get('finished')
+                or agent_id in task.get('members', [])):
+            effective_ability = np.zeros(self.traits_dim, dtype=float)
+            completion_potential = 0.0
+        else:
+            status = np.maximum(np.asarray(task['status'], dtype=float), 0.0)
+            abilities = np.asarray(agent['abilities'], dtype=float)
+            effective_ability = np.maximum(np.minimum(status, abilities), 0.0)
+            completion_potential = float(
+                status.sum() > 0 and np.all(status - abilities <= 0))
+        status = np.maximum(np.asarray(task['status'], dtype=float), 0.0)
+        remaining_total = float(status.sum())
+        requirement_reduction_ratio = (
+            float(effective_ability.sum()) / remaining_total
+            if remaining_total > 0 else 0.0)
+
+        velocity = max(float(agent.get('velocity', 0.2)), 1e-8)
+        travel_time = self.calculate_eulidean_distance(agent, task) / velocity
+        max_direct_time = np.sqrt(2.0) / velocity
+        travel_time = min(1.0, float(travel_time / max_direct_time))
+
+        waiting_pressure = self.get_task_waiting_pressure(task_id)
+        return np.asarray([
+            completion_potential,
+            requirement_reduction_ratio,
+            travel_time,
+            waiting_pressure,
+        ], dtype=float)
+
+    def get_task_waiting_pressure(self, task_id):
+        """Return normalized current waiting pressure for a task coalition."""
+        task = self.task_dic[task_id]
+        if task.get('feasible_assignment') or not task.get('members'):
+            return 0.0
+        waits = []
+        for member in task['members']:
+            try:
+                arrival_time = self.get_arrival_time(member, task_id)
+            except Exception:
+                continue
+            waits.append(max(0.0, float(self.current_time - arrival_time)))
+        if not waits:
+            return 0.0
+        return min(1.0, max(waits) / max(float(self.max_waiting_time), 1.0))
 
     def get_contributable_task_mask(self, agent_id):
         agent = self.agent_dic[agent_id]

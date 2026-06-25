@@ -3,9 +3,11 @@
 ## Goal
 
 Add a training-history recorder that produces evidence-rich reports for an
-LLM-generated decoder bias. The recorder records only the explicit robot-task
-feature `capability_match`; the separate window-level bias extension is
-specified in `deepseek_bias_spec.md`.
+LLM-generated decoder bias. The recorder keeps the binary robot-task
+diagnostic `capability_match` and records four action-level bias features:
+`completion_potential`, `requirement_reduction_ratio`, `travel_time`, and
+`waiting_pressure`. The separate window-level bias extension is specified in
+`deepseek_bias_spec.md`.
 
 `capability_match` must reuse the project's existing ability-mask logic. The
 logging path must not change masks, action sampling, rewards, or training
@@ -17,10 +19,10 @@ The existing Python configuration style must expose:
 
 ```python
 ENABLE_EVIDENCE_LOGGING = True
-EVIDENCE_LOG_INTERVAL_STEPS = 3000
+EVIDENCE_LOG_INTERVAL_STEPS = 10000
 EVIDENCE_OUTPUT_DIR = "./evidence_logs"
-MAX_CASES_PER_REPORT = 20
-MAX_CANDIDATES_PER_DECISION = 8
+MAX_CASES_PER_REPORT = 5
+MAX_CANDIDATES_PER_DECISION = 5
 ```
 
 Disabling logging must disable worker-side evidence collection and
@@ -54,8 +56,9 @@ Every effective training decision records:
 
 Each task candidate records task ID/state, validity, whether chosen, decoder
 logit and probability, remaining/original requirement vectors, and
-`capability_match`. Tensor values must be detached, moved to CPU, and
-converted to Python scalars/lists before entering the payload.
+`capability_match`. It also records the four explicit bias features and the
+per-action explicit feature logit bias. Tensor values must be detached, moved
+to CPU, and converted to Python scalars/lists before entering the payload.
 
 Candidates are the deduplicated union of the chosen action, top-probability
 valid actions, the highest-match action, representative valid positive-match
@@ -112,8 +115,9 @@ The Markdown report contains:
 2. **B. Failure mode distribution**: low-match decisions, low-match choices
    when a better valid alternative exists, and poor-match decisions before
    deadlock.
-3. **C. Feature definition**: state that `capability_match` is binary and
-   reuses the original ability-mask logic.
+3. **C. Feature definition**: state that `capability_match` is binary,
+   reuses the original ability-mask logic, and list the four explicit
+   action-level bias features.
 4. **D. Aggregate contrast**: compare decisions from the fastest 20% of
    successful episodes with failed episodes plus the slowest 20% of
    successful episodes.
@@ -125,7 +129,12 @@ The Markdown report contains:
 
 ```json
 {
-  "weights": {"capability_match": 0.0},
+  "weights": {
+    "completion_potential": 0.0,
+    "requirement_reduction_ratio": 0.0,
+    "travel_time": 0.0,
+    "waiting_pressure": 0.0
+  },
   "lambda": 0.0,
   "clip_range": [-2.0, 2.0],
   "rationale": {

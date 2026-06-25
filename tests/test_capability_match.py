@@ -51,6 +51,28 @@ class CapabilityMatchTest(unittest.TestCase):
 
         np.testing.assert_array_equal(expected, env.get_contributable_task_mask(agent_id))
 
+    def test_explicit_bias_features_are_action_level_and_normalized(self):
+        env = TaskEnv((1, 1), (1, 1), (1, 1), traits_dim=2, seed=3)
+        env.current_time = 10.0
+        agent = env.agent_dic[0]
+        task = env.task_dic[0]
+        agent['abilities'] = np.array([1, 0])
+        agent['location'] = np.array([0.0, 0.0])
+        agent['velocity'] = 1.0
+        task['status'] = np.array([1, 0])
+        task['requirements'] = np.array([1, 0])
+        task['location'] = np.array([1.0, 0.0])
+        task['members'] = []
+
+        features = env.get_explicit_bias_feature_matrix(0, action_count=2)
+
+        np.testing.assert_array_equal(features[0], np.zeros(4))
+        self.assertEqual(1.0, features[1][0])
+        self.assertEqual(1.0, features[1][1])
+        self.assertGreater(features[1][2], 0.0)
+        self.assertLessEqual(features[1][2], 1.0)
+        self.assertEqual(0.0, features[1][3])
+
 
 if __name__ == '__main__':
     unittest.main()

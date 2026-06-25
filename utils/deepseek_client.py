@@ -5,6 +5,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from utils.bias_manager import EXPLICIT_BIAS_FEATURES, zero_feature_weights
+
 
 class DeepSeekResponseTruncated(RuntimeError):
     """Raised when DeepSeek reports finish_reason=length."""
@@ -40,13 +42,22 @@ class DeepSeekClient:
 
     @staticmethod
     def build_prompt(report_text):
+        schema = {
+            'weights': zero_feature_weights(),
+            'lambda': 0.0,
+            'clip_range': [-2.0, 2.0],
+            'rationale': {
+                'main_failure_modes': [],
+                'expected_effect': [],
+            },
+        }
         return (
             'Analyze the evidence report below and return only one JSON object. '
-            'The only allowed explicit feature is capability_match. Use this '
-            'exact schema:\\n'
-            '{"weights":{"capability_match":0.0},"lambda":0.0,'
-            '"clip_range":[-2.0,2.0],"rationale":'
-            '{"main_failure_modes":[],"expected_effect":[]}}\\n\\n'
+            'The allowed decoder-bias features are: '
+            + ', '.join(EXPLICIT_BIAS_FEATURES)
+            + '. Use this exact schema and do not add other feature keys:\\n'
+            + json.dumps(schema, separators=(',', ':'))
+            + '\\n\\n'
             'EVIDENCE REPORT\\n'
             '================\\n'
             + report_text)

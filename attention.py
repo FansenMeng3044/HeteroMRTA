@@ -5,7 +5,7 @@ import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 from torch.cuda.amp.autocast_mode import autocast
 from parameters import *
-from utils.bias_manager import compute_capability_match_bias
+from utils.bias_manager import compute_explicit_feature_bias
 
 
 def get_attn_pad_mask(seq_q, seq_k):
@@ -301,7 +301,8 @@ class AttentionNet(nn.Module):
         return aggregated_agents, agents_encoding
 
     def forward(self, tasks, agents, global_mask, index, return_details=False,
-                capability_match=None, bias_params=None):
+                capability_match=None, explicit_features=None,
+                bias_params=None):
         task_mask = get_attn_pad_mask(tasks, tasks)
         agent_mask = get_attn_pad_mask(agents, agents)
         task_agent_mask = get_attn_pad_mask(tasks, agents)
@@ -314,10 +315,12 @@ class AttentionNet(nn.Module):
         current_state = self.fusion(torch.cat((current_state1, aggregated_task, aggregated_agents), dim=-1))
         current_state_prime = self.globalDecoder(current_state, task_agent_feature, None, global_mask)
         logit_bias = None
-        if (capability_match is not None and bias_params is not None
+        if explicit_features is None and capability_match is not None:
+            explicit_features = capability_match.unsqueeze(-1)
+        if (explicit_features is not None and bias_params is not None
                 and torch.any(bias_params[:, 0] != 0)):
-            logit_bias = compute_capability_match_bias(
-                capability_match,
+            logit_bias = compute_explicit_feature_bias(
+                explicit_features,
                 ~global_mask.bool(),
                 bias_params)
         pointer_output = self.pointer(

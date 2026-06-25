@@ -26,7 +26,9 @@ if 'matplotlib' not in sys.modules:
     sys.modules['matplotlib.offsetbox'] = matplotlib.offsetbox
 
 from parameters import EvidenceParams
-from utils.bias_manager import compute_capability_match_bias
+from utils.bias_manager import (
+    compute_explicit_feature_bias,
+)
 from worker import Worker
 
 
@@ -109,14 +111,20 @@ class FakeEnv:
         values[1] = 1.0
         return values
 
+    def get_explicit_bias_feature_matrix(self, agent_id, action_count=None):
+        rows = np.zeros((action_count or self.tasks_num + 1, 4), dtype=float)
+        rows[1] = np.array([1.0, 1.0, 0.0, 0.0])
+        return rows
+
 
 class DummyNetwork:
     def __init__(self):
-        self.last_capability_match = None
+        self.last_explicit_features = None
         self.last_bias_params = None
 
     def __call__(self, tasks, agents, mask, index, return_details=False,
-                 capability_match=None, bias_params=None):
+                 capability_match=None, explicit_features=None,
+                 bias_params=None):
         logits = torch.full(
             (tasks.shape[0], tasks.shape[1]),
             -100.0,
@@ -124,11 +132,13 @@ class DummyNetwork:
             device=tasks.device)
         logits[:, 1] = 0.0
         raw_logits = logits.clone()
-        if capability_match is not None and bias_params is not None:
-            self.last_capability_match = capability_match.detach().clone()
+        if explicit_features is None and capability_match is not None:
+            explicit_features = capability_match.unsqueeze(-1)
+        if explicit_features is not None and bias_params is not None:
+            self.last_explicit_features = explicit_features.detach().clone()
             self.last_bias_params = bias_params.detach().clone()
-            logit_bias = compute_capability_match_bias(
-                capability_match, ~mask.bool(), bias_params)
+            logit_bias = compute_explicit_feature_bias(
+                explicit_features, ~mask.bool(), bias_params)
             logits = logits + logit_bias
         else:
             logit_bias = torch.zeros_like(raw_logits)
@@ -194,13 +204,16 @@ class WorkerEvidenceTest(unittest.TestCase):
             EvidenceParams.MAX_CANDIDATES_PER_DECISION)
         debug = evidence_with['decisions'][0]['decoder_logit_debug']
         self.assertIn('raw_decoder_logits', debug)
-        self.assertIn('capability_logit_bias', debug)
+        self.assertIn('explicit_feature_logit_bias', debug)
         self.assertIn('biased_decoder_logits', debug)
         self.assertEqual(
             len(debug['raw_decoder_logits']),
             len(debug['biased_decoder_logits']))
         self.assertIn(
-            'capability_logit_bias',
+            'explicit_feature_logit_bias',
+            evidence_with['decisions'][0]['candidates'][0])
+        self.assertIn(
+            'explicit_features',
             evidence_with['decisions'][0]['candidates'][0])
         self.assertIn(
             'biased_model_logit',
@@ -213,7 +226,9 @@ class WorkerEvidenceTest(unittest.TestCase):
             no_config = self._run_once(False)
             disabled_config = self._run_once(False, {
                 'apply_bias': False,
-                'used_weight': 1.5,
+                'used_weights': {
+                    'completion_potential': 1.5,
+                },
                 'used_lambda': 0.9,
                 'clip_range': [-0.2, 0.2],
             })
@@ -229,7 +244,9 @@ class WorkerEvidenceTest(unittest.TestCase):
             'global_step': 3000,
             'source_report': 'evidence_window_00000000_00003000.md',
             'apply_bias': True,
-            'used_weight': 0.42,
+            'used_weights': {
+                'completion_potential': 0.42,
+            },
             'used_lambda': 0.06,
             'clip_range': [-0.5, 0.5],
         }
@@ -243,13 +260,17 @@ class WorkerEvidenceTest(unittest.TestCase):
         self.assertEqual(1, len(buffer[7]))
         self.assertEqual(1, len(buffer[8]))
         torch.testing.assert_close(
-            buffer[7][0][:2], torch.tensor([0.0, 1.0]))
-        expected_params = torch.tensor([1.0, 0.42, 0.06, -0.5, 0.5])
+            buffer[7][0][:2],
+            torch.tensor([[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0]]))
+        expected_params = torch.tensor([
+            1.0, 0.06, -0.5, 0.5,
+            0.42, 0.0, 0.0, 0.0,
+        ])
         torch.testing.assert_close(buffer[8][0], expected_params)
         torch.testing.assert_close(network.last_bias_params[0], expected_params)
         torch.testing.assert_close(
-            network.last_capability_match[0, :2],
-            torch.tensor([0.0, 1.0]))
+            network.last_explicit_features[0, :2],
+            torch.tensor([[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0]]))
 
     def test_timeout_and_deadlock_classification(self):
         with mock.patch('worker.TaskEnv', FakeEnv):

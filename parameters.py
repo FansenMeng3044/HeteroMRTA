@@ -11,7 +11,7 @@ class TrainParams:
     USE_GPU = False
     USE_GPU_GLOBAL = True
     NUM_GPU = 1
-    NUM_META_AGENT = 16
+    NUM_META_AGENT = 4
     LR = 1e-5
     GAMMA = 1
     DECAY_STEP = 2e3
@@ -49,10 +49,10 @@ class EvidenceParams:
     """Configuration for optional evidence-rich training reports."""
 
     ENABLE_EVIDENCE_LOGGING = True
-    EVIDENCE_LOG_INTERVAL_STEPS = 3000
+    EVIDENCE_LOG_INTERVAL_STEPS = 10000
     EVIDENCE_OUTPUT_DIR = './evidence_logs'
-    MAX_CASES_PER_REPORT = 20
-    MAX_CANDIDATES_PER_DECISION = 8
+    MAX_CASES_PER_REPORT = 5
+    MAX_CANDIDATES_PER_DECISION = 5
     TOP_K_CANDIDATES = 5
     LOW_CAPABILITY_THRESHOLD = 0.3
     BETTER_ALTERNATIVE_GAP = 0.3

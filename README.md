@@ -27,8 +27,11 @@ Three main structures of the code are as below:
 ## Evidence-rich training reports
 
 Evidence logging is configured by `EvidenceParams` in `parameters.py`. The
-recorder and optional DeepSeek bias use only the binary `capability_match`
-feature and reuse the environment's original contributable-task mask logic.
+recorder keeps the binary `capability_match` diagnostic and the optional
+DeepSeek bias uses four deterministic action-level features:
+`completion_potential`, `requirement_reduction_ratio`, `travel_time`, and
+`waiting_pressure`. The capability diagnostic still reuses the environment's
+original contributable-task mask logic.
 
 Ray workers collect lightweight episode payloads. Only the main process in
 `driver.py` writes files. At each configured transition window it creates:
@@ -41,7 +44,7 @@ evidence_logs/
   evidence_window_<start>_<end>.md
 ```
 
-The default evidence window is 3000 effective training transitions. The
+The default evidence window is 10000 effective training transitions. The
 DeepSeek update window is 30000 accepted transitions: reports are written at
 each small window, but the main process calls DeepSeek only at the larger
 update boundary, using all reports since the previous attempt, then caches the

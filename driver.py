@@ -291,7 +291,7 @@ def main():
                     reward_batch = torch.stack(rollouts[4], dim=0).unsqueeze(1).to(device)  # (batch,1,1)
                     index = torch.stack(rollouts[5]).to(device)
                     advantage_batch = torch.stack(rollouts[6], dim=0).to(device)  # (batch,1,1)
-                    capability_match_batch = torch.stack(
+                    explicit_features_batch = torch.stack(
                         rollouts[7], dim=0).to(device)
                     bias_params_batch = torch.stack(
                         rollouts[8], dim=0).to(device)
@@ -302,7 +302,7 @@ def main():
                         agent_inputs,
                         global_mask_batch,
                         index,
-                        capability_match=capability_match_batch,
+                        explicit_features=explicit_features_batch,
                         bias_params=bias_params_batch)
                     dist = Categorical(probs)
                     logp = dist.log_prob(action_batch.flatten())

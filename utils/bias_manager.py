@@ -6,14 +6,27 @@ from pathlib import Path
 import torch
 
 
+EXPLICIT_BIAS_FEATURES = (
+    'completion_potential',
+    'requirement_reduction_ratio',
+    'travel_time',
+    'waiting_pressure',
+)
+
+
+def zero_feature_weights():
+    return {feature: 0.0 for feature in EXPLICIT_BIAS_FEATURES}
+
+
 DISABLED_BIAS_SNAPSHOT = {
     'global_step': 0,
     'source_report': None,
     'apply_bias': False,
-    'used_weight': 0.0,
+    'feature_names': list(EXPLICIT_BIAS_FEATURES),
+    'used_weights': zero_feature_weights(),
     'used_lambda': 0.0,
     'clip_range': [-2.0, 2.0],
-    'raw_deepseek_weight': None,
+    'raw_deepseek_weights': None,
     'raw_deepseek_lambda': None,
     'ema_alpha': 0.3,
     'update_interval_steps': 30000,
@@ -23,8 +36,10 @@ DISABLED_BIAS_SNAPSHOT = {
 def normalize_bias_snapshot(snapshot=None):
     """Return a detached JSON-safe bias snapshot with conservative defaults."""
     normalized = dict(DISABLED_BIAS_SNAPSHOT)
+    normalized['used_weights'] = zero_feature_weights()
     if isinstance(snapshot, dict):
         normalized.update(snapshot)
+    normalized['feature_names'] = list(EXPLICIT_BIAS_FEATURES)
 
     def finite_float(value, default):
         try:
@@ -34,8 +49,13 @@ def normalize_bias_snapshot(snapshot=None):
         return value if math.isfinite(value) else default
 
     requested_apply = bool(normalized.get('apply_bias'))
-    normalized['used_weight'] = finite_float(
-        normalized.get('used_weight'), 0.0)
+    used_weights = normalized.get('used_weights')
+    if not isinstance(used_weights, dict):
+        used_weights = {}
+    normalized['used_weights'] = {
+        feature: finite_float(used_weights.get(feature), 0.0)
+        for feature in EXPLICIT_BIAS_FEATURES
+    }
     normalized['used_lambda'] = finite_float(
         normalized.get('used_lambda'), 0.0)
     clip_range = normalized.get('clip_range') or [-2.0, 2.0]
@@ -60,46 +80,76 @@ def normalize_bias_snapshot(snapshot=None):
         normalized['update_interval_steps'] = 30000
     normalized['ema_alpha'] = finite_float(
         normalized.get('ema_alpha'), 0.3)
-    for field in ('raw_deepseek_weight', 'raw_deepseek_lambda'):
-        value = normalized.get(field)
-        normalized[field] = (
-            finite_float(value, None) if value is not None else None)
+    raw_weights = normalized.get('raw_deepseek_weights')
+    if isinstance(raw_weights, dict):
+        normalized['raw_deepseek_weights'] = {
+            feature: (
+                finite_float(raw_weights.get(feature), None)
+                if raw_weights.get(feature) is not None else None)
+            for feature in EXPLICIT_BIAS_FEATURES
+        }
+    else:
+        normalized['raw_deepseek_weights'] = None
+    value = normalized.get('raw_deepseek_lambda')
+    normalized['raw_deepseek_lambda'] = (
+        finite_float(value, None) if value is not None else None)
     normalized['apply_bias'] = bool(
         requested_apply
-        and normalized['used_weight'] != 0.0
+        and any(value != 0.0 for value in normalized['used_weights'].values())
         and normalized['used_lambda'] != 0.0)
     return normalized
 
 
 def bias_snapshot_to_tensor(snapshot, device='cpu', dtype=torch.float32):
-    """Encode one immutable snapshot as [apply, weight, lambda, low, high]."""
+    """Encode one immutable snapshot as [apply, lambda, low, high, weights...]."""
     snapshot = normalize_bias_snapshot(snapshot)
-    return torch.tensor([[
+    values = [
         1.0 if snapshot['apply_bias'] else 0.0,
-        snapshot['used_weight'],
         snapshot['used_lambda'],
         snapshot['clip_range'][0],
         snapshot['clip_range'][1],
-    ]], dtype=dtype, device=device)
+    ]
+    values.extend(
+        snapshot['used_weights'][feature]
+        for feature in EXPLICIT_BIAS_FEATURES)
+    return torch.tensor([values], dtype=dtype, device=device)
 
 
-def compute_capability_match_bias(capability_match, valid_mask, bias_params):
-    """Compute clip(lambda * weight * capability_match) for each action."""
-    if capability_match is None or bias_params is None:
+def compute_explicit_feature_bias(explicit_features, valid_mask, bias_params):
+    """Compute clipped lambda * weighted explicit features for each action."""
+    if explicit_features is None or bias_params is None:
         return None
     if bias_params.dim() == 1:
         bias_params = bias_params.unsqueeze(0)
-    if capability_match.dim() == 1:
-        capability_match = capability_match.unsqueeze(0)
+    if explicit_features.dim() == 2:
+        explicit_features = explicit_features.unsqueeze(-1)
 
     apply_bias = bias_params[:, 0].unsqueeze(1)
-    weight = bias_params[:, 1].unsqueeze(1)
-    lambda_ = bias_params[:, 2].unsqueeze(1)
-    clip_low = bias_params[:, 3].unsqueeze(1)
-    clip_high = bias_params[:, 4].unsqueeze(1)
-    raw_bias = apply_bias * lambda_ * weight * capability_match
+    feature_dim = explicit_features.size(-1)
+    if bias_params.size(1) == 5 and feature_dim == 1:
+        # Compatibility with the previous capability_match-only tensor:
+        # [apply, weight, lambda, clip_low, clip_high].
+        weights = bias_params[:, 1].view(-1, 1, 1)
+        lambda_ = bias_params[:, 2].unsqueeze(1)
+        clip_low = bias_params[:, 3].unsqueeze(1)
+        clip_high = bias_params[:, 4].unsqueeze(1)
+    else:
+        weights = bias_params[:, 4:4 + feature_dim].unsqueeze(1)
+        lambda_ = bias_params[:, 1].unsqueeze(1)
+        clip_low = bias_params[:, 2].unsqueeze(1)
+        clip_high = bias_params[:, 3].unsqueeze(1)
+    feature_score = torch.sum(explicit_features * weights, dim=-1)
+    raw_bias = apply_bias * lambda_ * feature_score
     clipped = torch.maximum(torch.minimum(raw_bias, clip_high), clip_low)
     return torch.where(valid_mask.bool(), clipped, torch.zeros_like(clipped))
+
+
+def compute_capability_match_bias(capability_match, valid_mask, bias_params):
+    """Backward-compatible wrapper for the old single-feature tests/callers."""
+    if capability_match is None:
+        return None
+    return compute_explicit_feature_bias(
+        capability_match.unsqueeze(-1), valid_mask, bias_params)
 
 
 class BiasManager:
@@ -160,11 +210,20 @@ class BiasManager:
         weights = raw_config.get('weights')
         if not isinstance(weights, dict):
             raise ValueError('weights must be an object')
-        if set(weights) != {'capability_match'}:
-            raise ValueError('only capability_match weight is allowed')
+        unknown = set(weights) - set(EXPLICIT_BIAS_FEATURES)
+        if unknown:
+            raise ValueError(
+                'unsupported explicit feature weights: {}'.format(
+                    ', '.join(sorted(unknown))))
 
-        raw_weight = self._finite_number(
-            weights['capability_match'], 'weights.capability_match')
+        raw_weights = {}
+        sanitized_weights = {}
+        for feature in EXPLICIT_BIAS_FEATURES:
+            raw_weight = self._finite_number(
+                weights.get(feature, 0.0), 'weights.{}'.format(feature))
+            raw_weights[feature] = raw_weight
+            sanitized_weights[feature] = self._clamp(
+                raw_weight, self.weight_range)
         raw_lambda = self._finite_number(raw_config.get('lambda'), 'lambda')
         clip_range = raw_config.get('clip_range')
         if not isinstance(clip_range, list) or len(clip_range) != 2:
@@ -176,27 +235,29 @@ class BiasManager:
         if clip_low >= clip_high:
             raise ValueError('clip_range must satisfy low < high')
 
-        sanitized_weight = self._clamp(raw_weight, self.weight_range)
         sanitized_lambda = self._clamp(raw_lambda, self.lambda_range)
         return {
-            'weights': {'capability_match': sanitized_weight},
+            'weights': sanitized_weights,
             'lambda': sanitized_lambda,
             'clip_range': [clip_low, clip_high],
             'rationale': self._sanitize_rationale(
                 raw_config.get('rationale')),
-            'raw_deepseek_weight': raw_weight,
+            'raw_deepseek_weights': raw_weights,
             'raw_deepseek_lambda': raw_lambda,
         }
 
     def update_from_config(self, raw_config, global_step, source_report):
         sanitized = self.sanitize(raw_config)
-        previous_weight = self.current['used_weight']
+        previous_weights = self.current['used_weights']
         previous_lambda = self.current['used_lambda']
-        raw_weight = sanitized['weights']['capability_match']
+        raw_weights = sanitized['weights']
         raw_lambda = sanitized['lambda']
-        used_weight = (
-            self.ema_alpha * raw_weight
-            + (1.0 - self.ema_alpha) * previous_weight)
+        used_weights = {
+            feature: (
+                self.ema_alpha * raw_weights[feature]
+                + (1.0 - self.ema_alpha) * previous_weights[feature])
+            for feature in EXPLICIT_BIAS_FEATURES
+        }
         used_lambda = (
             self.ema_alpha * raw_lambda
             + (1.0 - self.ema_alpha) * previous_lambda)
@@ -204,11 +265,14 @@ class BiasManager:
             'global_step': int(global_step),
             'source_report': Path(source_report).name,
             'apply_bias': bool(
-                self.enabled and used_weight != 0.0 and used_lambda != 0.0),
-            'used_weight': used_weight,
+                self.enabled
+                and any(value != 0.0 for value in used_weights.values())
+                and used_lambda != 0.0),
+            'feature_names': list(EXPLICIT_BIAS_FEATURES),
+            'used_weights': used_weights,
             'used_lambda': used_lambda,
             'clip_range': sanitized['clip_range'],
-            'raw_deepseek_weight': sanitized['raw_deepseek_weight'],
+            'raw_deepseek_weights': sanitized['raw_deepseek_weights'],
             'raw_deepseek_lambda': sanitized['raw_deepseek_lambda'],
             'ema_alpha': self.ema_alpha,
             'update_interval_steps': self.update_interval_steps,
@@ -222,9 +286,14 @@ class BiasManager:
     def get_snapshot(self):
         snapshot = dict(self.current)
         snapshot['clip_range'] = list(self.current['clip_range'])
+        snapshot['feature_names'] = list(EXPLICIT_BIAS_FEATURES)
+        snapshot['used_weights'] = dict(self.current['used_weights'])
+        if snapshot.get('raw_deepseek_weights') is not None:
+            snapshot['raw_deepseek_weights'] = dict(
+                snapshot['raw_deepseek_weights'])
         if not self.enabled:
             snapshot['apply_bias'] = False
-            snapshot['used_weight'] = 0.0
+            snapshot['used_weights'] = zero_feature_weights()
             snapshot['used_lambda'] = 0.0
         return snapshot
 

@@ -31,8 +31,16 @@ class AttentionEvidenceOutputTest(unittest.TestCase):
         agents = torch.rand(1, 3, 4) + 0.1
         mask = torch.tensor([[False, False, True, False]])
         index = torch.tensor([[[1]]])
-        capability = torch.tensor([[0.0, 1.0, 1.0, 0.0]])
-        bias_params = torch.tensor([[1.0, 1.0, 0.5, -2.0, 2.0]])
+        explicit_features = torch.tensor([[
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ]])
+        bias_params = torch.tensor([[
+            1.0, 0.5, -2.0, 2.0,
+            1.0, 0.0, 0.0, 0.0,
+        ]])
 
         (probs, _, final_logits, raw_logits, logit_bias,
          biased_logits) = network(
@@ -41,7 +49,7 @@ class AttentionEvidenceOutputTest(unittest.TestCase):
             mask,
             index,
             return_details='all',
-            capability_match=capability,
+            explicit_features=explicit_features,
             bias_params=bias_params)
 
         torch.testing.assert_close(logit_bias[0], torch.tensor(
